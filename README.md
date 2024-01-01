@@ -1,4 +1,4 @@
 # BQSched
 BQSched - Encrypted Code Repository for VLDB 2024 Submission "BQSched: A Non-Intrusive Batch Query Scheduler via Reinforcement Learning"
 
-As explained in our supplemental material, these codes are currently restricted to internal access and use within the reviewer community.
+The detailed access method has been submitted to reviewers within our supplemental material via the conference management tool (CMT). Currently, these codes are restricted to internal access within the reviewer community, as explained in the supplemental material.
