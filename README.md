@@ -1,5 +1,5 @@
 # BQSched
-BQSched - Encrypted Code Repository for SIGMOD 2025 Submission "BQSched: A Non-Intrusive Batch Query Scheduler via Reinforcement Learning"
+BQSched - Encrypted Code Repository for ICDE 2025 Submission "BQSched: A Non-intrusive Scheduler for Batch Concurrent Queries via Reinforcement Learning"
 
 Please download the compressed file `BQSched.7z` and decompress it with the encryption key submitted via the Conference Management Toolkit (CMT) to access the codes. Currently, these codes are restricted to internal access within the reviewer community, as explained in the response to the Artifact Availability Requirements.
 
