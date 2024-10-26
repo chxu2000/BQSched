@@ -1,0 +1,660 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def add_zeros(t):
+    return torch.concat([torch.zeros(t.shape[1:], dtype=t.dtype, device=t.device).unsqueeze(0), t])
+
+class Prediction(nn.Module):
+    def __init__(self, in_feature = 69, hid_units = 256, contract = 1, mid_layers = True, res_con = True):
+        super(Prediction, self).__init__()
+        self.mid_layers = mid_layers
+        self.res_con = res_con
+        
+        self.out_mlp1 = nn.Linear(in_feature, hid_units)
+
+        self.mid_mlp1 = nn.Linear(hid_units, hid_units//contract)
+        self.mid_mlp2 = nn.Linear(hid_units//contract, hid_units)
+
+        self.out_mlp2 = nn.Linear(hid_units, 1)
+
+    def forward1(self, features):
+        
+        hid = F.relu(self.out_mlp1(features))
+        if self.mid_layers:
+            mid = F.relu(self.mid_mlp1(hid))
+            mid = F.relu(self.mid_mlp2(mid))
+            if self.res_con:
+                hid = hid + mid
+            else:
+                hid = mid
+        out = torch.sigmoid(self.out_mlp2(hid))
+
+        return out
+
+    def forward(self, features):
+
+        hid = F.relu(self.out_mlp1(features))
+
+        out = torch.sigmoid(self.out_mlp2(hid))
+
+        return out
+
+
+class FeatureEmbed(nn.Module):
+    # def __init__(self, embed_size=32, tables = 10, types=20, joins = 40, columns= 30, \
+    #              ops=4, use_sample = True, use_hist = True, bin_number = 50):
+    def __init__(self, embed_size=32, tables = 30, types=25, joins = 260, columns= 450, \
+                 ops=10, use_sample = True, use_hist = True, bin_number = 50):
+        super(FeatureEmbed, self).__init__()
+        
+        self.use_sample = use_sample
+        self.embed_size = embed_size        
+        
+        self.use_hist = use_hist
+        self.bin_number = bin_number
+        
+        self.typeEmbed = nn.Embedding(types, embed_size)
+        self.tableEmbed = nn.Embedding(tables, embed_size)
+        
+        self.columnEmbed = nn.Embedding(columns, embed_size)
+        self.opEmbed = nn.Embedding(ops, embed_size//8)
+
+        self.linearFilter2 = nn.Linear(embed_size+embed_size//8+1, embed_size+embed_size//8+1)
+        self.linearFilter = nn.Linear(embed_size+embed_size//8+1, embed_size+embed_size//8+1)
+
+        self.linearType = nn.Linear(embed_size, embed_size)
+        
+        self.linearJoin = nn.Linear(embed_size, embed_size)
+        
+        self.linearSample = nn.Linear(1000, embed_size)
+        
+        self.linearHist = nn.Linear(bin_number, embed_size)
+
+        self.joinEmbed = nn.Embedding(joins, embed_size)
+        
+        if use_hist:
+            self.project = nn.Linear(embed_size*5 + embed_size//8+1, embed_size*5 + embed_size//8+1)
+        else:
+            self.project = nn.Linear(embed_size*4 + embed_size//8+1, embed_size*4 + embed_size//8+1)
+    
+    # input: B by 14 (type, join, f1, f2, f3, mask1, mask2, mask3)
+    def forward(self, feature):
+
+        typeId, joinId, filtersId, filtersMask, hists, table_sample = torch.split(feature,(1,1,9,3,self.bin_number*3,1001), dim = -1)
+        
+        typeEmb = self.getType(typeId)
+        joinEmb = self.getJoin(joinId)
+        filterEmbed = self.getFilter(filtersId, filtersMask)
+        
+        histEmb = self.getHist(hists, filtersMask)
+        tableEmb = self.getTable(table_sample)
+    
+        if self.use_hist:
+            final = torch.cat((typeEmb, filterEmbed, joinEmb, tableEmb, histEmb), dim = 1)
+        else:
+            final = torch.cat((typeEmb, filterEmbed, joinEmb, tableEmb), dim = 1)
+        final = F.leaky_relu(self.project(final))
+        
+        return final
+    
+    def getType(self, typeId):
+        emb = self.typeEmbed(typeId.long())
+
+        return emb.squeeze(1)
+    
+    def getTable(self, table_sample):
+        table, sample = torch.split(table_sample,(1,1000), dim = -1)
+        emb = self.tableEmbed(table.long()).squeeze(1)
+        
+        if self.use_sample:
+            emb += self.linearSample(sample)
+        return emb
+    
+    def getJoin(self, joinId):
+        emb = self.joinEmbed(joinId.long())
+
+        return emb.squeeze(1)
+
+    def getHist(self, hists, filtersMask):
+        # batch * 50 * 3
+        histExpand = hists.view(-1,self.bin_number,3).transpose(1,2)
+        
+        emb = self.linearHist(histExpand)
+        emb[~filtersMask.bool()] = 0.  # mask out space holder
+        
+        ## avg by # of filters
+        num_filters = torch.sum(filtersMask,dim = 1)
+        total = torch.sum(emb, dim = 1)
+        avg = total / num_filters.view(-1,1)
+        avg = torch.where(torch.isnan(avg), torch.full_like(avg, 0), avg)
+        
+        return avg
+        
+    def getFilter(self, filtersId, filtersMask):
+        ## get Filters, then apply mask
+        filterExpand = filtersId.view(-1,3,3).transpose(1,2)
+        colsId = filterExpand[:,:,0].long()
+        opsId = filterExpand[:,:,1].long()
+        vals = filterExpand[:,:,2].unsqueeze(-1) # b by 3 by 1
+        
+        # b by 3 by embed_dim
+        
+        col = self.columnEmbed(colsId)
+        op = self.opEmbed(opsId)
+        
+        concat = torch.cat((col, op, vals), dim = -1)
+        concat = F.leaky_relu(self.linearFilter(concat))
+        concat = F.leaky_relu(self.linearFilter2(concat))
+        
+        ## apply mask
+        concat[~filtersMask.bool()] = 0.
+        
+        ## avg by # of filters
+        num_filters = torch.sum(filtersMask,dim = 1)
+        total = torch.sum(concat, dim = 1)
+        avg = total / num_filters.view(-1,1)
+        avg = torch.where(torch.isnan(avg), torch.full_like(avg, 0), avg)
+                
+        return avg
+    
+#     def get_output_size(self):
+#         size = self.embed_size * 5 + self.embed_size // 8 + 1
+#         return size
+
+
+
+class QueryFormer(nn.Module):
+    def __init__(self, emb_size = 32 ,ffn_dim = 32, head_size = 8, \
+                 dropout = 0.1, attention_dropout_rate = 0.1, n_layers = 2, \
+                 use_sample = True, use_hist = True, bin_number = 50, \
+                 pred_hid = 256
+                ):
+        
+        super(QueryFormer,self).__init__()
+        if use_hist:
+            hidden_dim = emb_size * 5 + emb_size //8 + 1
+        else:
+            hidden_dim = emb_size * 4 + emb_size //8 + 1
+        self.hidden_dim = hidden_dim
+        self.head_size = head_size
+        self.use_sample = use_sample
+        self.use_hist = use_hist
+
+        self.rel_pos_encoder = nn.Embedding(64, head_size, padding_idx=0)
+
+        self.height_encoder = nn.Embedding(64, hidden_dim, padding_idx=0)
+        
+        self.input_dropout = nn.Dropout(dropout)
+        encoders = [EncoderLayer(hidden_dim, ffn_dim, dropout, attention_dropout_rate, head_size)
+                    for _ in range(n_layers)]
+        self.layers = nn.ModuleList(encoders)
+        
+        self.final_ln = nn.LayerNorm(hidden_dim)
+        
+        self.super_token = nn.Embedding(1, hidden_dim)
+        self.super_token_virtual_distance = nn.Embedding(1, head_size)
+        
+        
+        self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number)
+        
+        # self.pred = Prediction(hidden_dim, pred_hid)
+
+        # if multi-task
+        # self.pred2 = Prediction(hidden_dim, pred_hid)
+        
+    # def forward(self, batched_data):
+    #     attn_bias, rel_pos, x = batched_data.attn_bias, batched_data.rel_pos, batched_data.x
+
+    #     heights = batched_data.heights     
+        
+    def forward(self, attn_bias, rel_pos, x, heights):
+
+        n_batch, n_node = x.size()[:2]
+        tree_attn_bias = attn_bias.clone()
+        tree_attn_bias = tree_attn_bias.unsqueeze(1).repeat(1, self.head_size, 1, 1) 
+        
+        # rel pos
+        rel_pos_bias = self.rel_pos_encoder(rel_pos).permute(0, 3, 1, 2) # [n_batch, n_node, n_node, n_head] -> [n_batch, n_head, n_node, n_node]
+        tree_attn_bias[:, :, 1:, 1:] = tree_attn_bias[:, :, 1:, 1:] + rel_pos_bias
+
+
+        # reset rel pos here
+        t = self.super_token_virtual_distance.weight.view(1, self.head_size, 1)
+        tree_attn_bias[:, :, 1:, 0] = tree_attn_bias[:, :, 1:, 0] + t
+        tree_attn_bias[:, :, 0, :] = tree_attn_bias[:, :, 0, :] + t
+        
+        x_view = x.view(-1, 1165)
+        node_feature = self.embbed_layer(x_view).view(n_batch,-1, self.hidden_dim)
+        
+        # -1 is number of dummy
+        
+        node_feature = node_feature + self.height_encoder(heights)
+        super_token_feature = self.super_token.weight.unsqueeze(0).repeat(n_batch, 1, 1)
+        super_node_feature = torch.cat([super_token_feature, node_feature], dim=1)        
+        
+        # transfomrer encoder
+        output = self.input_dropout(super_node_feature)
+        for enc_layer in self.layers:
+            output = enc_layer(output, tree_attn_bias)
+        output = self.final_ln(output)
+        
+        # return self.pred(output[:,0,:]), self.pred2(output[:,0,:]), output[:,0,:]
+        return output[:,0,:]
+
+
+class SharedQueryFormer(nn.Module):
+    def __init__(self, hidden_dim=128, emb_size = 32 ,ffn_dim = 32, head_size = 8, \
+                 dropout = 0.1, attention_dropout_rate = 0.2, n_layers = 2, \
+                 use_sample = True, use_hist = True, bin_number = 50, pred_hid = 256, \
+                 query_num = 99, enable_qf = False, train_qf_data=None, con_query_num=20,
+                ):
+        
+        super(SharedQueryFormer, self).__init__()
+
+        self.enable_qf = enable_qf
+        
+        # self.linear_time = nn.Linear(1, hidden_dim)
+
+        if self.enable_qf:
+            self.train_qf_data = train_qf_data
+            self.train_qf_data.attn_bias = add_zeros(self.train_qf_data.attn_bias).to('cuda')
+            self.train_qf_data.rel_pos = add_zeros(self.train_qf_data.rel_pos).to('cuda')
+            self.train_qf_data.x = add_zeros(self.train_qf_data.x).to('cuda')
+            self.train_qf_data.heights = add_zeros(self.train_qf_data.heights).to('cuda')
+            self.query_former = QueryFormer(emb_size=emb_size, ffn_dim=ffn_dim, head_size=head_size, dropout=dropout,
+                                            attention_dropout_rate=attention_dropout_rate, n_layers=n_layers, use_sample=use_sample,
+                                            use_hist=use_hist, bin_number=bin_number, pred_hid=pred_hid)
+            self.linear_in = nn.Linear(query_num + self.query_former.hidden_dim, hidden_dim-4)
+        else:
+            self.input_dropout = nn.Dropout(dropout)
+            self.linear_in = nn.Linear(query_num, hidden_dim-4)
+
+        self.super_node_encoder = nn.Embedding(1, embedding_dim=hidden_dim)
+        encoders = [EncoderLayer(hidden_dim, ffn_dim, dropout, attention_dropout_rate, head_size)
+                    for _ in range(n_layers)]
+        self.layers = nn.ModuleList(encoders)
+        
+        #self.final_ln = nn.LayerNorm(hidden_dim*2)
+        init_dim = hidden_dim * 2 + con_query_num * 3
+        self.final_ln = nn.Sequential(
+            nn.Linear(init_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, hidden_dim),
+            nn.ReLU(),
+        )
+        
+        # self.super_token = nn.Embedding(1, hidden_dim)
+        # self.super_token_virtual_distance = nn.Embedding(1, head_size)
+        
+        
+        # self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number)
+        
+        self.pred = Prediction(hidden_dim, pred_hid)
+        self.linear_to_time = nn.Linear(hidden_dim, 1)
+
+        # if multi-task
+        # self.pred2 = Prediction(hidden_dim, pred_hid)
+        
+
+
+    def forward(self, qids, embeddings, times, workers, base_cost):
+
+        # time_embedding = self.linear_time(times)
+        # time_embedding = times.repeat(1,1, con_queries.shape[2])
+        # transfomrer encoder
+        if self.enable_qf:
+            qids = qids.to(self.train_qf_data.attn_bias.device)
+            attn_bias, rel_pos, x, heights = self.train_qf_data.attn_bias[qids], \
+                self.train_qf_data.rel_pos[qids], self.train_qf_data.x[qids], self.train_qf_data.heights[qids]
+            attn_bias, rel_pos, x, heights = attn_bias.to(times.device), rel_pos.to(times.device), x.to(times.device), heights.to(times.device)
+            embeddings_qf = self.query_former(attn_bias.view(-1, attn_bias.shape[-2], attn_bias.shape[-1]), rel_pos.view(-1, rel_pos.shape[-2], rel_pos.shape[-1]),
+                                              x.view(-1, x.shape[-2], x.shape[-1]), heights.view(-1, heights.shape[-1]))
+            embeddings_qf = embeddings_qf.view(rel_pos.shape[0], rel_pos.shape[1], -1)
+            embeddings = self.linear_in(torch.cat([embeddings, embeddings_qf], dim=-1))
+        else:
+            embeddings = self.input_dropout(embeddings)
+            embeddings = self.linear_in(embeddings)
+
+        x = torch.cat([embeddings, times, workers, base_cost, base_cost - times], dim=2)
+        #x = torch.cat([con_queries, times, workers,], dim=2)
+
+        n_batch, n_query = x.shape[0], x.shape[1]
+        super_node_embedding = self.super_node_encoder.weight.unsqueeze(0).repeat(n_batch, 1, 1)
+        output = torch.cat([super_node_embedding, x], dim=1)
+        for enc_layer in self.layers:
+            output = enc_layer(output)
+
+        # minvalue, _ = torch.min(output, dim=1)
+        # minvalue = minvalue.unsqueeze(dim=1)
+        # minvalue = minvalue.repeat(1, output.shape[1], 1)
+
+        # output = torch.cat([x - output, minvalue, x], dim=2)
+
+        output = torch.cat([output[:, 1:, :], output[:, 0:1, :].repeat(1, n_query, 1),
+                            times.view(n_batch, 1, -1).repeat(1, n_query, 1), workers.view(n_batch, 1, -1).repeat(1, n_query, 1),
+                            base_cost.view(n_batch, 1, -1).repeat(1, n_query, 1)], dim=2)
+        output = self.final_ln(output)
+
+        # minvalue,_ = torch.min(output,dim=1)
+        # minvalue = minvalue.unsqueeze(dim=1)
+        # minvalue = torch.repeat(1, output.shape[1],1)
+
+        #output = torch.cat([output, minvalue, x], dim=2)
+        #output = torch.cat([output, x], dim=2)
+
+        output_time = self.linear_to_time(output).squeeze()
+        output_index = self.pred(output).squeeze()
+
+        #output_time = self.linear_to_time(output).squeeze()
+        #output_index = self.pred(output).squeeze()
+        # return self.pred(output).squeeze()
+        return output_time, output_index
+
+        # return self.pred(output).squeeze()
+
+
+class ConcurrentQueryFormer(nn.Module):
+    def __init__(self, hidden_dim=128, emb_size = 32 ,ffn_dim = 32, head_size = 8, \
+                 dropout = 0.1, attention_dropout_rate = 0.2, n_layers = 2, \
+                 use_sample = True, use_hist = True, bin_number = 50, pred_hid = 256, \
+                 query_num = 99,
+                ):
+        
+        super(ConcurrentQueryFormer,self).__init__()
+
+
+        
+        self.linear_time = nn.Linear(1, hidden_dim)
+        self.input_dropout = nn.Dropout(dropout)
+
+        self.linear_in = nn.Linear(query_num, hidden_dim-4)
+
+        encoders = [EncoderLayer(hidden_dim, ffn_dim, dropout, attention_dropout_rate, head_size)
+                    for _ in range(n_layers)]
+        self.layers = nn.ModuleList(encoders)
+        
+        #self.final_ln = nn.LayerNorm(hidden_dim*2)
+        self.final_ln = nn.Linear(hidden_dim*3, hidden_dim)
+        
+        self.super_token = nn.Embedding(1, hidden_dim)
+        self.super_token_virtual_distance = nn.Embedding(1, head_size)
+        
+        
+        self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number)
+        
+        self.pred = Prediction(hidden_dim, pred_hid)
+        self.linear_to_time = nn.Linear(hidden_dim, 1)
+
+        # if multi-task
+        # self.pred2 = Prediction(hidden_dim, pred_hid)
+        
+
+
+    def forward(self, con_queries, times, workers, base_cost):
+
+        # time_embedding = self.linear_time(times)
+        # time_embedding = times.repeat(1,1, con_queries.shape[2])
+        # transfomrer encoder
+        if con_queries.shape[2] < self.linear_in.in_features:
+            con_queries = torch.cat([con_queries, torch.zeros((con_queries.shape[0], con_queries.shape[1], self.linear_in.in_features - con_queries.shape[2])).to('cuda')], dim=2)
+        elif con_queries.shape[2] > self.linear_in.in_features:
+            inc_num = con_queries.shape[2] - self.linear_in.in_features
+            con_queries[:, :, -2*inc_num:-inc_num] += con_queries[:, :, -inc_num:]
+            con_queries = con_queries[:, :, :-inc_num]
+        con_queries = self.input_dropout(con_queries)
+        con_queries = self.linear_in(con_queries)
+
+        x = torch.cat([con_queries, times, workers, base_cost, base_cost - times], dim=2)
+        #x = torch.cat([con_queries, times, workers,], dim=2)
+
+        output = x
+        for enc_layer in self.layers:
+            output = enc_layer(output)
+
+        minvalue, _ = torch.min(output, dim=1)
+        minvalue = minvalue.unsqueeze(dim=1)
+        minvalue = minvalue.repeat(1, output.shape[1], 1)
+
+        output = torch.cat([x - output, minvalue, x], dim=2)
+        output = self.final_ln(output)
+
+        # minvalue,_ = torch.min(output,dim=1)
+        # minvalue = minvalue.unsqueeze(dim=1)
+        # minvalue = torch.repeat(1, output.shape[1],1)
+
+        #output = torch.cat([output, minvalue, x], dim=2)
+        #output = torch.cat([output, x], dim=2)
+
+        output_time = self.linear_to_time(output).squeeze()
+        output_index = self.pred(output).squeeze()
+
+        #output_time = self.linear_to_time(output).squeeze()
+        #output_index = self.pred(output).squeeze()
+        # return self.pred(output).squeeze()
+        return output_time, output_index
+
+        # return self.pred(output).squeeze()
+
+    def forward1(self, con_queries, times):
+
+        time_embedding = self.linear_time(times)
+        # transfomrer encoder
+        output = self.input_dropout(con_queries + time_embedding)
+        output = self.linear_in(output)
+
+        for enc_layer in self.layers:
+            output = enc_layer(output)
+        output = self.final_ln(output)
+
+        return self.pred(output).squeeze()
+
+    def forward2(self, con_queries, times, base_cost):
+
+        # time_embedding = self.linear_time(times)
+        # time_embedding = times.repeat(1,1, con_queries.shape[2])
+        x = torch.cat([con_queries, times, base_cost, base_cost - times], dim=2)
+        # transfomrer encoder
+        x = self.input_dropout(x)
+        x = self.linear_in(x)
+
+        output = x
+        for enc_layer in self.layers:
+            output = enc_layer(output)
+
+        minvalue, _ = torch.min(output, dim=1)
+        minvalue = minvalue.unsqueeze(dim=1)
+        minvalue = minvalue.repeat(1, output.shape[1], 1)
+
+        output = torch.cat([output, x, minvalue], dim=2)
+        output = self.final_ln(output)
+
+        # minvalue,_ = torch.min(output,dim=1)
+        # minvalue = minvalue.unsqueeze(dim=1)
+        # minvalue = torch.repeat(1, output.shape[1],1)
+
+        # output = torch.cat([output, minvalue, x], dim=2)
+
+        output_time = self.linear_to_time(output).squeeze()
+        output_index = self.pred(output).squeeze()
+        # return self.pred(output).squeeze()
+        return output_time, output_index
+
+        # return self.pred(output).squeeze()
+
+class MultiQueryFormer(nn.Module):
+    def __init__(self, emb_size = 32 ,ffn_dim = 32, head_size = 8, \
+                 dropout = 0.1, attention_dropout_rate = 0.1, n_layers = 8, \
+                 use_sample = True, use_hist = True, bin_number = 50, \
+                 pred_hid = 256, query_num = 8
+                ):
+        
+        super(MultiQueryFormer,self).__init__()
+        if use_hist:
+            hidden_dim = emb_size * 5 + emb_size //8 + 1
+        else:
+            hidden_dim = emb_size * 4 + emb_size //8 + 1
+        self.hidden_dim = hidden_dim
+        self.head_size = head_size
+        self.use_sample = use_sample
+        self.use_hist = use_hist
+        self.query_num = query_num
+
+        self.rel_pos_encoder = nn.Embedding(64, head_size, padding_idx=0)
+
+        self.height_encoder = nn.Embedding(64, hidden_dim, padding_idx=0)
+        
+        self.input_dropout = nn.Dropout(dropout)
+        encoders = [EncoderLayer(hidden_dim, ffn_dim, dropout, attention_dropout_rate, head_size)
+                    for _ in range(n_layers)]
+        self.layers = nn.ModuleList(encoders)
+        
+        self.final_ln = nn.LayerNorm(hidden_dim)
+        
+        self.super_token = nn.Embedding(1, hidden_dim)
+        self.super_token_virtual_distance = nn.Embedding(1, head_size)
+        
+        
+        self.embbed_layer = FeatureEmbed(emb_size, use_sample = use_sample, use_hist = use_hist, bin_number = bin_number)
+        
+        self.pred = Prediction(hidden_dim * query_num, pred_hid)
+
+        # if multi-task
+        self.pred2 = Prediction(hidden_dim * query_num, pred_hid)
+        
+    def forward(self, batched_data):
+        attn_bias, rel_pos, x = batched_data.attn_bias, batched_data.rel_pos, batched_data.x
+
+        heights = batched_data.heights     
+        
+        n_batch, n_node = x.size()[:2]
+        tree_attn_bias = attn_bias.clone()
+        tree_attn_bias = tree_attn_bias.unsqueeze(1).repeat(1, self.head_size, 1, 1) 
+        
+        # rel pos
+        rel_pos_bias = self.rel_pos_encoder(rel_pos).permute(0, 3, 1, 2) # [n_batch, n_node, n_node, n_head] -> [n_batch, n_head, n_node, n_node]
+        tree_attn_bias[:, :, 1:, 1:] = tree_attn_bias[:, :, 1:, 1:] + rel_pos_bias
+
+
+        # reset rel pos here
+        t = self.super_token_virtual_distance.weight.view(1, self.head_size, 1)
+        tree_attn_bias[:, :, 1:, 0] = tree_attn_bias[:, :, 1:, 0] + t
+        tree_attn_bias[:, :, 0, :] = tree_attn_bias[:, :, 0, :] + t
+        
+        x_view = x.view(-1, 1165)
+        node_feature = self.embbed_layer(x_view).view(n_batch,-1, self.hidden_dim)
+        
+        # -1 is number of dummy
+        
+        node_feature = node_feature + self.height_encoder(heights)
+        super_token_feature = self.super_token.weight.unsqueeze(0).repeat(n_batch, 1, 1)
+        super_node_feature = torch.cat([super_token_feature, node_feature], dim=1)        
+        
+        # transfomrer encoder
+        output = self.input_dropout(super_node_feature)
+        for enc_layer in self.layers:
+            output = enc_layer(output, tree_attn_bias)
+        output = self.final_ln(output)
+
+        # aggregate multi-query embedding
+        if output.shape[0] % self.query_num != 0:
+            raise Exception('shape of batched_data inconsistent with query_num')
+        output = output[:,0,:]
+        output = torch.cat([torch.cat([output[i+j] for j in range(self.query_num)], dim=0).unsqueeze(0) for i in range(0, output.shape[0], self.query_num)], dim=0)
+
+
+        
+        return self.pred(output), self.pred2(output)
+
+
+
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, hidden_size, ffn_size, dropout_rate):
+        super(FeedForwardNetwork, self).__init__()
+
+        self.layer1 = nn.Linear(hidden_size, ffn_size)
+        self.gelu = nn.GELU()
+        self.layer2 = nn.Linear(ffn_size, hidden_size)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.gelu(x)
+        x = self.layer2(x)
+        return x
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden_size, attention_dropout_rate, head_size):
+        super(MultiHeadAttention, self).__init__()
+
+        self.head_size = head_size
+
+        self.att_size = att_size = hidden_size // head_size
+        self.scale = att_size ** -0.5
+
+        self.linear_q = nn.Linear(hidden_size, head_size * att_size)
+        self.linear_k = nn.Linear(hidden_size, head_size * att_size)
+        self.linear_v = nn.Linear(hidden_size, head_size * att_size)
+        self.att_dropout = nn.Dropout(attention_dropout_rate)
+
+        self.output_layer = nn.Linear(head_size * att_size, hidden_size)
+
+    def forward(self, q, k, v, attn_bias=True):
+        orig_q_size = q.size()
+
+        d_k = self.att_size
+        d_v = self.att_size
+        batch_size = q.size(0)
+
+        # head_i = Attention(Q(W^Q)_i, K(W^K)_i, V(W^V)_i)
+        q = self.linear_q(q).view(batch_size, -1, self.head_size, d_k)
+        k = self.linear_k(k).view(batch_size, -1, self.head_size, d_k)
+        v = self.linear_v(v).view(batch_size, -1, self.head_size, d_v)
+
+        q = q.transpose(1, 2)                  # [b, h, q_len, d_k]
+        v = v.transpose(1, 2)                  # [b, h, v_len, d_v]
+        k = k.transpose(1, 2).transpose(2, 3)  # [b, h, d_k, k_len]
+
+        # Scaled Dot-Product Attention.
+        # Attention(Q, K, V) = softmax((QK^T)/sqrt(d_k))V
+        q = q * self.scale
+        x = torch.matmul(q, k)  # [b, h, q_len, k_len]
+        if attn_bias is not None:
+            x = x + attn_bias
+
+        x = torch.softmax(x, dim=3)
+        x = self.att_dropout(x)
+        x = x.matmul(v)  # [b, h, q_len, attn]
+
+        x = x.transpose(1, 2).contiguous()  # [b, q_len, h, attn]
+        x = x.view(batch_size, -1, self.head_size * d_v)
+
+        x = self.output_layer(x)
+
+        assert x.size() == orig_q_size
+        return x
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, head_size):
+        super(EncoderLayer, self).__init__()
+
+        self.self_attention_norm = nn.LayerNorm(hidden_size)
+        self.self_attention = MultiHeadAttention(hidden_size, attention_dropout_rate, head_size)
+        self.self_attention_dropout = nn.Dropout(dropout_rate)
+
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+        self.ffn = FeedForwardNetwork(hidden_size, ffn_size, dropout_rate)
+        self.ffn_dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, attn_bias=None):
+        y = self.self_attention_norm(x)
+        y = self.self_attention(y, y, y, attn_bias)
+        y = self.self_attention_dropout(y)
+        x = x + y
+
+        y = self.ffn_norm(x)
+        y = self.ffn(y)
+        y = self.ffn_dropout(y)
+        x = x + y
+        return x
