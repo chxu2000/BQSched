@@ -1,5 +1,5 @@
 # BQSched
-BQSched - Encrypted Code Repository for ICDE 2025 Submission "BQSched: A Non-intrusive Scheduler for Batch Concurrent Queries via Reinforcement Learning"
+BQSched - Code Repository for ICDE 2025 Submission "BQSched: A Non-intrusive Scheduler for Batch Concurrent Queries via Reinforcement Learning"
 
 Here are the codes for four different experiments as follows on TPC-DS benchmark with PostgreSQL:
 
