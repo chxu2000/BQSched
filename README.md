@@ -1,6 +1,4 @@
 # BQSched
-BQSched - Code Repository for ICDE 2025 Submission "BQSched: A Non-intrusive Scheduler for Batch Concurrent Queries via Reinforcement Learning"
-
 Here are the codes for four different experiments as follows on TPC-DS benchmark with PostgreSQL:
 
 - train_from_scratch
@@ -8,7 +6,7 @@ Here are the codes for four different experiments as follows on TPC-DS benchmark
 - pre_train
 - fine_tune
 
-## How to Run
+## Quick Start
 
 Please follow the steps below to run the script for each mode:
 
@@ -19,4 +17,12 @@ Please follow the steps below to run the script for each mode:
    - The corresponding configurations for each mode are in files `modes/args/{mode_name}.py` and `modes/config/{mode_name}.ini`.
    - Note that you need to replace the configurations for the underlying DBMS connection with information about your target DBMS (including host, port, user, password, max_worker, etc.), and collect workload information in advance with reference to the contents in the folder `envs/scheduler/cache/your_host/`.
 4. Check the runtime logs in the file `outs/{host_postfix}.runtime.out` and the results in the `logs/` folder.
+
+## Reproducing Key Results
+
+Coming soon.
+
+## Citing
+
+Coming soon.
 
