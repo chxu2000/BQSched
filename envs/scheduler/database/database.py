@@ -35,7 +35,7 @@ class Database:
                 )
                 conn = psycopg2.connect(conn_string)
                 conn.set_session(autocommit=True)
-                if database.startswith('tpcds'):
+                if database.startswith('tpcds') or database.startswith('imdb'):
                     with conn.cursor() as cur:
                         cur.execute('SET enable_nestloop=off;')
                 #cursor.execute('set ON_ERROR_ROLLBACK true')

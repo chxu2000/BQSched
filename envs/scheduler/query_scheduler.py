@@ -1,4 +1,4 @@
-import os, sys, time, json, pickle, numpy as np, psutil, torch
+import os, sys, time, json, pickle, numpy as np, psutil, torch, math, multiprocessing
 from datetime import datetime
 from threading import Event
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -7,8 +7,11 @@ from configparser import ConfigParser
 from envs.scheduler.query_list import QueryList
 from envs.scheduler.table_list import TableList
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from simulator.net.transformer import ConcurrentQueryFormer, SharedQueryFormer
+from simulator.net.query_former import ConcurrentQueryFormer, SharedQueryFormer
+from sortedcontainers import SortedList
 
+
+CPU_LOAD = False
 
 def get_config(path):
     conf = ConfigParser()
@@ -22,6 +25,117 @@ def print_time(hint, file=None):
         pass
     else:
         print(f'[{time.time():.3f}] {hint}', file=file, flush=True)
+
+
+def generate_cpu_load(duration, load_percent, num_cores):
+    """
+    在指定数量的 CPU 核上生成指定百分比的负载
+    :param duration: 负载持续时间（秒）
+    :param load_percent: 负载百分比（0-100），表示 CPU 占用率
+    :param num_cores: 使用的 CPU 核数
+    """
+    def set_cpu_affinity(pid, cpu_id):
+        """
+        设置进程的 CPU 亲和性，将进程绑定到指定的核。
+        :param pid: 进程的 PID。
+        :param cpu_id: 目标 CPU 核的 ID。
+        """
+        try:
+            os.sched_setaffinity(pid, {cpu_id})
+        except AttributeError:
+            raise RuntimeError("CPU affinity setting is not supported on this platform.")
+    
+    def cpu_task(load_percent, duration):
+        """
+        单个核的负载任务。
+        :param load_percent: 负载百分比 (0-100)。
+        :param duration: 任务持续时间（秒）。
+        """
+        interval = 0.1  # 控制负载的调度间隔（秒）
+        work_time = interval * load_percent / 100  # 计算在每个 interval 中工作的时间
+        idle_time = interval - work_time  # 计算在每个 interval 中休息的时间
+
+        end_time = time.time() + duration
+        while time.time() < end_time:
+            start = time.time()
+            # 模拟工作负载
+            while time.time() - start < work_time:
+                math.sqrt(123456)  # 模拟计算密集型工作
+            # 模拟空闲
+            time.sleep(idle_time)
+    
+    # 创建并启动进程
+    processes = []
+    for cpu_id in range(num_cores):
+        p = multiprocessing.Process(target=cpu_task, args=(load_percent, duration))
+        processes.append((p, cpu_id))  # 将进程和对应的核 ID 绑定
+        p.start()
+
+    # 设置每个进程的 CPU 亲和性
+    for p, cpu_id in processes:
+        set_cpu_affinity(p.pid, cpu_id)
+
+    # 等待所有进程完成
+    for p, _ in processes:
+        p.join()
+
+
+def generate_memory_load(duration, memory_size_mb, step_mb=10):
+    """
+    生成内存负载
+    :param duration: 持续时间（秒）
+    :param memory_size_mb: 内存占用目标大小（MB）
+    :param step_mb: 每步增长的内存大小（MB）
+    """
+    block_size = 1024 * 1024  # 每 MB 的字节数
+    memory_blocks = []  # 存放内存块
+
+    end_time = time.time() + duration
+    while time.time() < end_time:
+        # 分配内存
+        for _ in range(memory_size_mb // step_mb):
+            memory_blocks.append(bytearray(step_mb * block_size))
+            time.sleep(0.5)  # 模拟规律增长
+
+        # 清理内存
+        memory_blocks.clear()
+        time.sleep(1)  # 模拟规律下降
+
+
+def generate_io_load(duration, file_size_mb, block_size_kb=4):
+    """
+    生成读 I/O 负载
+    :param duration: 持续时间（秒）
+    :param file_size_mb: 文件大小（MB）
+    :param block_size_kb: 每次读取的块大小（KB）
+    """
+    block_size = block_size_kb * 1024  # 每块字节数
+    total_blocks = (file_size_mb * 1024 * 1024) // block_size  # 块数
+    file_path = "temp_io_load_file"  # 临时文件路径
+
+    # 创建一个临时文件，写入随机数据以供读取
+    with open(file_path, "wb") as f:
+        for _ in range(total_blocks):
+            f.write(os.urandom(block_size))  # 写入随机数据
+
+    # 开始模拟读 I/O 负载
+    end_time = time.time() + duration
+    while time.time() < end_time:
+        with open(file_path, "rb") as f:
+            for _ in range(total_blocks):
+                f.read(block_size)  # 按块读取文件内容，模拟磁盘读操作
+
+        time.sleep(0.5)  # 模拟规律的负载间隔
+
+    # 删除临时文件
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+
+def cpu_load_1():
+    for _ in range(2):
+        for i in range(5):
+            generate_cpu_load(1, 80, i*2)
 
 
 def thread_query(i, conn, query, runtime_log=None):
@@ -97,6 +211,10 @@ class QueryScheduler():
         self.max_worker = self.conf.getint('scheduler', 'max_worker') if max_worker is None else max_worker
         self.enable_monitor = self.conf.getboolean('scheduler', 'enable_monitor')
         self.use_simulator = self.conf.getboolean('database', 'use_simulator')
+        self.vary_conn_num = 'vary_conn_num' in self.conf['scheduler'] and self.conf.getboolean('scheduler', 'vary_conn_num')
+        if self.vary_conn_num:
+            self.min_worker = self.conf.getint('scheduler', 'min_worker')
+        self.compress_action_c = 'compress_action_c' in self.conf['scheduler'] and self.conf.getboolean('scheduler', 'compress_action_c')
         self.simulator_model = self.conf['database']['simulator_model']
         self.database = Database(self.conf)  # 存放元数据啥的
         self.conn_list = []
@@ -105,7 +223,8 @@ class QueryScheduler():
         if self.enable_monitor and not self.use_simulator:
             self.monitor_conn = self.database.connect(database='postgres')
         # printtime("Finish Initialize Connections")
-        self.queries = sorted(self.database.get_queries(), key=lambda x:x[0])
+        self.queries = self.database.get_queries()
+        # self.queries = sorted(self.database.get_queries(), key=lambda x:x[0])
         if not query_num is None:
             self.queries = self.queries[:query_num]
         self.query_num = len(self.queries)
@@ -133,7 +252,8 @@ class QueryScheduler():
                 self.time_scale = self.conf.getint('database', 'time_scale')
                 self.enable_cluster_embedding = self.conf.getboolean('database', 'enable_cluster_embedding')
                 self.use_rank_loss = self.conf.getboolean('database', 'use_rank_loss')
-                self.con_query_former = torch.load(f'envs/scheduler/cache/{self.conf["database"]["host"]}/{self.conf["database"]["database"]}/cqf_w{self.conf["scheduler"]["max_worker"]}.pth')
+                model_name = f'{self.conf["database"]["simulator_model_name"]}_{self.conf["database"]["query_scale"]}-{self.conf["scheduler"]["max_worker"]}{self.conf["database"]["simulator_datapath_postfix"]}'
+                self.con_query_former = torch.load(f'envs/scheduler/cache/{self.conf["database"]["host"]}/{self.conf["database"]["database"]}/{model_name}.pth')
                 if self.enable_cluster_embedding and self.query_scale > 1:
                     self.cluster_query_num = self.query_num // self.query_scale
                     self.query_embeddings = np.eye(self.cluster_query_num).astype('float32') # One-hot Encoding
@@ -191,12 +311,12 @@ class QueryScheduler():
             base_costs = np.array(base_list).astype('float32')
             workers = np.array([[((self.query_worker[i]+2 if self.conf['database']['database'].startswith('tpcds') else self.query_worker[i]+3) 
                                   if self.query_worker[i] > 0 else self.query_worker[i] + 1) if i > 0 else 0] for i in qids]).astype('float32')
-            query_embeddings, time_lasts, workers, base_costs = torch.tensor(query_embeddings).to('cuda'), \
+            qids, query_embeddings, time_lasts, workers, base_costs = torch.tensor(qids).to('cuda'), torch.tensor(query_embeddings).to('cuda'), \
                 torch.tensor(time_lasts).to('cuda'), torch.tensor(workers).to('cuda'), torch.tensor(base_costs).to('cuda')
-            query_embeddings, time_lasts, workers, base_costs = query_embeddings.unsqueeze(0), \
+            qids, query_embeddings, time_lasts, workers, base_costs = qids.unsqueeze(0), query_embeddings.unsqueeze(0), \
                 time_lasts.unsqueeze(0), workers.unsqueeze(0), base_costs.unsqueeze(0)
             if type(self.con_query_former).__name__ == ConcurrentQueryFormer.__name__:
-                output_time, output_index = self.con_query_former(query_embeddings, time_lasts*self.time_scale, workers, base_costs*self.time_scale)
+                output_time, output_index = self.con_query_former(qids, query_embeddings, time_lasts*self.time_scale, workers, base_costs*self.time_scale)
             elif type(self.con_query_former).__name__ == SharedQueryFormer.__name__:
                 output_time, output_index = self.con_query_former(None, query_embeddings, time_lasts*self.time_scale, workers, base_costs*self.time_scale)
             finish_index = min(output_time.argmin().item() if self.use_rank_loss else output_index.argmax().item(), len(self.executing_queries)-1)
@@ -239,6 +359,12 @@ class QueryScheduler():
             'finish_qposs': [],
             'finish_times': [],
         }
+        if self.vary_conn_num:
+            self.action_c, self.last_action_c, self.keep_conn = -1, -1, False
+            if self.compress_action_c:
+                self.inactive_conn_ids, self.running_conn_ids, self.idle_conn_ids = SortedList(), SortedList(), SortedList(range(self.max_worker))
+            else:
+                self.inactive_conn_ids, self.running_conn_ids, self.idle_conn_ids = SortedList(range(self.min_worker, self.max_worker)), SortedList(), SortedList(range(self.min_worker))
     
     def start_query(self, qid, worker, conn_id, q_start_time=None):
         qpos = self.query_list.id_to_pos[qid]
@@ -300,8 +426,8 @@ class QueryScheduler():
             self.info_aux['finish_times'].append([self.query_time_info['end'][qpos] - self.start_time])
         else:
             self.info_aux['finish_times'].append([self.query_time_info['end'][qpos] - self.query_time_info['end'][self.info_aux['finish_qposs'][-2][0]]])
-        if len(self.pending_qposs) == 0 and len(self.executed_qposs) < self.args.query_num:
-            query_status = np.zeros((self.args.query_num,), dtype=np.int64)
+        if len(self.pending_qposs) == 0 and len(self.executed_qposs) < self.query_num:
+            query_status = np.zeros((self.args.query_num*self.query_scale,), dtype=np.int64)
             query_status[np.array(self.executing_qposs, dtype=np.int64)] = \
                 1 if not self.args.enable_worker else [1 + self.query_worker[i] for i in self.executing_queries]
             query_status[np.array(self.executed_qposs, dtype=np.int64)] = \
@@ -346,57 +472,63 @@ class QueryScheduler():
     def schedule_with_yield(self):
         self.preprocess()
         # printtime("******Start Scheduler")
-        self.query_list = QueryList(self.database.conn, self.queries, None, self.conf)
+        self.query_list = QueryList(self.database.conn, self.queries, None, self.conf, self.vary_conn_num)
         # with ThreadPoolExecutor(max_workers=self.max_worker if not self.enable_monitor else self.max_worker+1) as t:
         t = ThreadPoolExecutor(max_workers=self.max_worker if not self.enable_monitor else self.max_worker+1) if not self.use_simulator else None
         finish_event = Event() if not self.use_simulator else None
         if self.enable_monitor and not self.use_simulator:
             t.submit(thread_monitor, self.monitor_conn, finish_event, 5, self.runtime_log)
+        if CPU_LOAD:
+            t_load = ThreadPoolExecutor(1)
+            obj_list_load = [t_load.submit(cpu_load_1)]
         obj_list = []
-        for qid in range(self.max_worker):
-            if not self.use_simulator and self.enable_resource and (not self.conn_ssh is None or self.local_resource):
-                self.resource_status = None if self.use_simulator else (get_local_resource() if self.local_resource else get_remote_resource(self.conn_ssh))
-                print_time(f'resource status: cpu {100-self.resource_status["cpu_times_percent"].idle:.2f}%, vmem {self.resource_status["virtual_memory"].percent:.2f}%, smem {self.resource_status["swap_memory"].percent:.2f}%',
-                           self.runtime_log)
-            yield 0
-            if qid == 0:
-                self.start_time = time.time()
-                self.current_time = self.start_time
-                self.last_end_time = self.start_time
-                self.query_list.start_time = self.start_time
-            cur_state = {
-                'conn_id': qid,
-                'cur_queries': self.executing_queries
-            }
-            if self.query_list.query_scale > 1 and self.query_cluster:
-                query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos+self.query_list.original_query_num*(self.current_cluster-1), worker=self.next_worker, cur_state=cur_state)
-            else:
-                query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
-            obj = t.submit(thread_query, qid, self.conn_list[qid], query, self.runtime_log) if not self.use_simulator else None
-            if not self.use_simulator:
-                self.start_query(query[0][0], self.next_worker, qid, time.time())
-            else:
-                self.current_time = time.time()
-                self.start_query(query[0][0], self.next_worker, qid, self.current_time)
-            obj_list.append(obj)
-        self.current_time = time.time()
-        while (not self.query_list.empty() and not self.err_flag):
-            if not self.use_simulator:
-                time.sleep(0.01)
-                for future in obj_list:
-                    if future.done():
-                        idx, qid, self.err_flag, q_end_time = future.result()
-                        if self.err_flag:
-                            break
-                        if qid != -1:
-                            self.finish_query(qid, q_end_time)
-                        obj_list.remove(future)
-                        if not self.query_list.empty():
-                            if self.enable_resource and (not self.conn_ssh is None or self.local_resource):
-                                self.resource_status = None if self.use_simulator else (get_local_resource() if self.local_resource else get_remote_resource(self.conn_ssh))
-                                print_time(f'resource status: cpu {100-self.resource_status["cpu_times_percent"].idle:.2f}%, vmem {self.resource_status["virtual_memory"].percent:.2f}%, smem {self.resource_status["swap_memory"].percent:.2f}%',
-                                           self.runtime_log)
-                            yield 0
+        if self.vary_conn_num:
+            while (not self.query_list.empty() and not self.err_flag):
+                if not self.use_simulator:
+                    time.sleep(0.01)
+                    for future in obj_list:
+                        if future.done():
+                            idx, qid, self.err_flag, q_end_time = future.result()
+                            if self.err_flag:
+                                break
+                            if qid != -1:
+                                self.finish_query(qid, q_end_time)
+                            obj_list.remove(future)
+                            self.running_conn_ids.remove(idx)
+                            self.idle_conn_ids.add(idx)
+                            self.last_action_c = -1
+                            self.keep_conn = False
+                    if not self.query_list.empty() and not self.keep_conn:
+                        if self.enable_resource and (not self.conn_ssh is None or self.local_resource):
+                            self.resource_status = None if self.use_simulator else (get_local_resource() if self.local_resource else get_remote_resource(self.conn_ssh))
+                            print_time(f'resource status: cpu {100-self.resource_status["cpu_times_percent"].idle:.2f}%, vmem {self.resource_status["virtual_memory"].percent:.2f}%, smem {self.resource_status["swap_memory"].percent:.2f}%',
+                                    self.runtime_log)
+                        yield 0
+                        if self.action_c != -1:
+                            if self.action_c == 0:     # add conn
+                                idx = self.inactive_conn_ids[0]
+                                self.inactive_conn_ids.remove(idx)
+                                self.idle_conn_ids.add(idx)
+                                print_time(f"add connection {idx}, conn status [{len(self.inactive_conn_ids)}, {len(self.idle_conn_ids)}, {len(self.running_conn_ids)}]", file=self.runtime_log)
+                            elif self.action_c == 1:   # keep conn
+                                self.keep_conn = True
+                                print_time(f"keep connection, conn status [{len(self.inactive_conn_ids)}, {len(self.idle_conn_ids)}, {len(self.running_conn_ids)}]", file=self.runtime_log)
+                            elif self.action_c == 2:   # remove conn
+                                idx = self.idle_conn_ids[-1]
+                                self.idle_conn_ids.remove(idx)
+                                self.inactive_conn_ids.add(idx)
+                                print_time(f"remove connection {idx}, conn status [{len(self.inactive_conn_ids)}, {len(self.idle_conn_ids)}, {len(self.running_conn_ids)}]", file=self.runtime_log)
+                            else:
+                                raise Exception("Invalid action_c")
+                            self.last_action_c = self.action_c
+                            self.action_c = -1
+                        else:
+                            if self.start_time == -1:
+                                self.start_time = time.time()
+                                self.current_time = self.start_time
+                                self.last_end_time = self.start_time
+                                self.query_list.start_time = self.start_time
+                            idx = self.idle_conn_ids[0]
                             cur_state = {
                                 'conn_id': idx,
                                 'cur_queries': self.executing_queries
@@ -409,18 +541,90 @@ class QueryScheduler():
                             if query[0][0] != -1:
                                 self.start_query(query[0][0], self.next_worker, idx, time.time())
                             obj_list.append(obj)
-            else:
-                idx, qid = self.predict()
-                self.finish_query(qid)
-                if not self.query_list.empty():
-                    yield 0
-                    cur_state = {
-                        'conn_id': idx,
-                        'cur_queries': self.executing_queries
-                    }
+                            self.idle_conn_ids.remove(idx)
+                            self.running_conn_ids.add(idx)
+                            self.last_action_c = -1
+                else:
+                    idx, qid = self.predict()
+                    self.finish_query(qid)
+                    if not self.query_list.empty():
+                        yield 0
+                        cur_state = {
+                            'conn_id': idx,
+                            'cur_queries': self.executing_queries
+                        }
+                        query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
+                        if query[0][0] != -1:
+                            self.start_query(query[0][0], self.next_worker, idx)
+        else:
+            for qid in range(self.max_worker):
+                if not self.use_simulator and self.enable_resource and (not self.conn_ssh is None or self.local_resource):
+                    self.resource_status = None if self.use_simulator else (get_local_resource() if self.local_resource else get_remote_resource(self.conn_ssh))
+                    print_time(f'resource status: cpu {100-self.resource_status["cpu_times_percent"].idle:.2f}%, vmem {self.resource_status["virtual_memory"].percent:.2f}%, smem {self.resource_status["swap_memory"].percent:.2f}%',
+                            self.runtime_log)
+                yield 0
+                if qid == 0:
+                    self.start_time = time.time()
+                    self.current_time = self.start_time
+                    self.last_end_time = self.start_time
+                    self.query_list.start_time = self.start_time
+                cur_state = {
+                    'conn_id': qid,
+                    'cur_queries': self.executing_queries
+                }
+                if self.query_list.query_scale > 1 and self.query_cluster:
+                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos+self.query_list.original_query_num*(self.current_cluster-1), worker=self.next_worker, cur_state=cur_state)
+                else:
                     query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
-                    if query[0][0] != -1:
-                        self.start_query(query[0][0], self.next_worker, idx)
+                obj = t.submit(thread_query, qid, self.conn_list[qid], query, self.runtime_log) if not self.use_simulator else None
+                if not self.use_simulator:
+                    self.start_query(query[0][0], self.next_worker, qid, time.time())
+                else:
+                    self.current_time = time.time()
+                    self.start_query(query[0][0], self.next_worker, qid, self.current_time)
+                obj_list.append(obj)
+            self.current_time = time.time()
+            while (not self.query_list.empty() and not self.err_flag):
+                if not self.use_simulator:
+                    time.sleep(0.01)
+                    for future in obj_list:
+                        if future.done():
+                            idx, qid, self.err_flag, q_end_time = future.result()
+                            if self.err_flag:
+                                break
+                            if qid != -1:
+                                self.finish_query(qid, q_end_time)
+                            obj_list.remove(future)
+                            if not self.query_list.empty():
+                                if self.enable_resource and (not self.conn_ssh is None or self.local_resource):
+                                    self.resource_status = None if self.use_simulator else (get_local_resource() if self.local_resource else get_remote_resource(self.conn_ssh))
+                                    print_time(f'resource status: cpu {100-self.resource_status["cpu_times_percent"].idle:.2f}%, vmem {self.resource_status["virtual_memory"].percent:.2f}%, smem {self.resource_status["swap_memory"].percent:.2f}%',
+                                            self.runtime_log)
+                                yield 0
+                                cur_state = {
+                                    'conn_id': idx,
+                                    'cur_queries': self.executing_queries
+                                }
+                                if self.query_list.query_scale > 1 and self.query_cluster:
+                                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos+self.query_list.original_query_num*(self.current_cluster-1), worker=self.next_worker, cur_state=cur_state)
+                                else:
+                                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
+                                obj = t.submit(thread_query, idx, self.conn_list[idx], query, self.runtime_log)
+                                if query[0][0] != -1:
+                                    self.start_query(query[0][0], self.next_worker, idx, time.time())
+                                obj_list.append(obj)
+                else:
+                    idx, qid = self.predict()
+                    self.finish_query(qid)
+                    if not self.query_list.empty():
+                        yield 0
+                        cur_state = {
+                            'conn_id': idx,
+                            'cur_queries': self.executing_queries
+                        }
+                        query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
+                        if query[0][0] != -1:
+                            self.start_query(query[0][0], self.next_worker, idx)
         if not self.use_simulator:
             _, not_done = wait(obj_list, timeout=3000)
             end_time = time.time()
@@ -444,16 +648,19 @@ class QueryScheduler():
         # printtime("******Finish Scheduler")
         time_last = end_time - self.start_time if self.use_simulator or (not self.err_flag and len(not_done) == 0) else -1
         if not self.use_simulator:
-            print("Time last %.2f" % (time_last), flush=True)
-            print("Time last %.2f" % (time_last), file=self.runtime_log, flush=True)
+            time_last_str = "Time last %.2f (%s%d)" % (time_last, self.conf["database"]["database"], self.query_scale)
+            print(time_last_str, flush=True)
+            print(time_last_str, file=self.runtime_log, flush=True)
         else:
-            print("Time last %.2f, actual %.2f" % (time_last, time.time() - self.start_time), flush=True)
+            print("Time last %.2f, actual %.2f (%s%d)" % (time_last, time.time() - self.start_time, self.conf["database"]["database"], self.query_scale), flush=True)
         self.cost = time_last
         # assert min(self.query_time_info['end']) > 0, 'Terminate when queries still executing'
         if min(self.query_time_info['end']) < 0:
             print(f'Terminate when queries still executing (time last={time_last:.3f})')
         last_end_times = sorted(self.query_time_info['end'], reverse=True)[:self.max_worker]
         self.mean_tailing = np.mean(last_end_times) - last_end_times[-1]
+        if CPU_LOAD:
+            wait(obj_list_load)
         yield 1
 
 if __name__ == '__main__':

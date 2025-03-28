@@ -15,22 +15,28 @@ class Args():
     train_reward_type = 'relative_time_with_baseline'
     eval_reward_type = 'cost'
     # model
-    model_type = 'mppg_attsncwcq'
+    model_type = 'mppg_attsncwcqia'
     seed = 0
     hierarchical_mode = 2
     # train
-    runs_per_train = 25
-    runs_per_eval = 50
-    train_eval_episodes = 5
+    runs_per_train = 20
+    runs_per_eval = 40
+    train_eval_episodes = 2
     runs_per_logfile = 2500
     reset_num_timesteps = True
     log_path = 'logs/'
-    run_name = 'mtippg_attsncwcq_rsrtbs_tpcds1X_wf'
+    run_name = 'mtippg_attsncwcqia_rsrtbs_tpcds1Xhtmt_wf'
     # run_name = 'aaa'
     pretrain_path = 'outputs/mppg_rsrtbs_tpcds1X10oc50_simcqf_wf_1/best_model_28'
+    hybrid_training = True
+    multi_task = True
+    task_adaptive = True
+    value_adaptive = True
+    entropy_adaptive = True
+    sub_save_freq = 1
     # test
     test_eval_episodes = 2
-    checkpoint_path = 'outputs/ma2c_attsncwpecq_rsdrtbs_tpcds1X_wf_2/best_model_22'
+    checkpoint_path = 'logs/mtippg_attsncwcqia_rsrtbs_tpcds1Xht_wf_1/outputs/best_model_34'
     # test all
     test_run_name = 'aaa_6'
     # pretrain

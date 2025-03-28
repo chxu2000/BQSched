@@ -1,4 +1,5 @@
 class Args():
+    devices = "0"
     query_num = 99
     init_baseline = 55
     enable_embedding = False

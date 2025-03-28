@@ -567,6 +567,8 @@ class MaskableActorCriticPolicySN(MaskableActorCriticPolicy):
         obs: th.Tensor,
         actions: th.Tensor,
         action_masks: Optional[np.ndarray] = None,
+        normalize_entropy: bool = False,
+        query_nums: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
@@ -590,7 +592,13 @@ class MaskableActorCriticPolicySN(MaskableActorCriticPolicy):
                 distribution.apply_masking(action_masks)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
-        return values, log_prob, distribution.entropy()
+        if normalize_entropy:
+            entropy = distribution.entropy()
+            query_nums_ = query_nums[obs['task_id'].squeeze().to(th.int)]
+            entropy = entropy / th.log(query_nums_)
+            return values, log_prob, entropy
+        else:
+            return values, log_prob, distribution.entropy()
 
     def get_distribution(self, obs: th.Tensor, action_masks: Optional[np.ndarray] = None) -> MaskableDistribution:
         """
@@ -667,6 +675,8 @@ class MaskableMultiInputActorCriticPolicySN(MaskableActorCriticPolicySN):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         preprocess_obs: bool = True,
         cluster_num: int = None,
+        *args,
+        **kwargs,
     ):
         super().__init__(
             observation_space,
@@ -848,6 +858,11 @@ class MaskableAuxActorCriticPolicySN(MaskableActorCriticPolicySN):
         :return: action, value and log probability of the action
         """
         distribution, _, latent_vf, _, _ = self.forward_policy(obs, action_masks)
+        # if True:
+        #     obs_, action_masks_ = obs, action_masks
+        #     obs_["query_status"], obs_["time_last"] = obs_["query_status"][:, :99], obs_["time_last"][:, :99]
+        #     action_masks_ = np.concatenate([action_masks_[:, :99], action_masks_[:, 198:297]], axis=-1)
+        #     distribution_, _, latent_vf_, _, _ = self.forward_policy(obs_, action_masks_)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         actions = distribution.get_actions(deterministic=deterministic)

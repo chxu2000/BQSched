@@ -143,6 +143,9 @@ class MaskablePPG(MaskablePPO):
         aux_value_time: bool = False,
         aux_time_ind: bool = False,
         aux_vf_distance: bool = False,
+        task_adaptive: bool = False,
+        value_adaptive: bool = False,
+        entropy_adaptive: bool = False,
     ):
 
         super().__init__(
@@ -197,6 +200,9 @@ class MaskablePPG(MaskablePPO):
             self.aux_time_ind = aux_time_ind
             self.policy_kwargs["aux_time_ind"] = self.aux_time_ind
             self.aux_vf_distance = aux_vf_distance
+        self.task_adaptive = task_adaptive
+        self.value_adaptive = value_adaptive
+        self.entropy_adaptive = entropy_adaptive
 
         if use_paper_parameters:
             self._set_paper_parameters()
@@ -249,6 +255,9 @@ class MaskablePPG(MaskablePPO):
 
         super()._setup_model()
 
+        self._post_setup_model()
+
+    def _post_setup_model(self) -> None:
         buffer_size = self.n_steps * self.n_envs * self.n_policy_iters
         if type(self.rollout_buffer.observation_space) is spaces.Dict:
             self.obs_keys = self.rollout_buffer.observations.keys()
@@ -307,6 +316,33 @@ class MaskablePPG(MaskablePPO):
         state_dicts, var_list = super()._get_torch_save_params()
         state_dicts.append("policy.aux_optimizer")
         return state_dicts, var_list
+    
+    def set_env(self, env, n_steps=None, force_reset=True):
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.policy.observation_space = env.observation_space
+        self.policy.action_space = env.action_space
+        try:
+            self.policy.features_extractor.query_num = env.observation_space['query_status'].shape[0]
+        except Exception as e:
+            self.policy.features_extractor.query_num = env.observation_space.shape[0]
+        self.policy.action_dist.action_dim = env.action_space.n
+        super().set_env(env, force_reset)
+
+        if n_steps is not None:
+            self.n_steps = n_steps
+        buffer_cls = MaskableDictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else MaskableRolloutBuffer
+        self.rollout_buffer = buffer_cls(
+            self.n_steps,
+            self.observation_space,
+            self.action_space,
+            self.device,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs,
+        )
+        
+        self._post_setup_model()
     
     def collect_rollouts(
         self,
@@ -419,9 +455,12 @@ class MaskablePPG(MaskablePPO):
             self._last_episode_starts = dones
 
             for idx, done in enumerate(dones):
+                sched_env = env.envs[0].env.env
+                if not hasattr(sched_env, "baseline"):
+                    sched_env = sched_env.env
                 if (
                     done
-                    and rewards[0] <= env.envs[0].env.env.baseline
+                    and rewards[0] <= sched_env.baseline
                 ):
                     if type(self.rollout_buffer.observations) == dict:
                         rollout_start_pos = self._curr_n_policy_iters * len(next(iter(self.rollout_buffer.observations.values())))
@@ -429,8 +468,8 @@ class MaskablePPG(MaskablePPO):
                         rollout_start_pos = self._curr_n_policy_iters * len(self.rollout_buffer.observations)
                     start_pos = rollout_start_pos + rollout_buffer.pos
                     for info in rollout_infos:
-                        if env.envs[0].env.env.reward_type == 'delayed_relative_time_with_baseline':
-                            sched_env, scheduler = env.envs[0].env.env, env.envs[0].env.env._last_scheduler
+                        if sched_env.reward_type == 'delayed_relative_time_with_baseline':
+                            scheduler = sched_env._last_scheduler
                             qpos = info['actions'][0][0] % sched_env.action_num
                             try:
                                 if self.policy.features_extractor.enable_cl:
@@ -460,9 +499,9 @@ class MaskablePPG(MaskablePPO):
                     rollout_infos = []
                 elif (
                     done
-                    and rewards[0] > env.envs[0].env.env.baseline
+                    and rewards[0] > sched_env.baseline
                 ):
-                    query_num = len(env.envs[0].env.env._scheduler.query_list.ids)
+                    query_num = len(sched_env._scheduler.query_list.ids)
                     self.num_timesteps -= env.num_envs * query_num
                     n_steps -= query_num
                     callback.n_calls -= query_num
@@ -484,8 +523,162 @@ class MaskablePPG(MaskablePPO):
         """
         Update policy using the currently gathered rollout buffer.
         """
-        super().train()
+        # super().train()
+        # Switch to train mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(True)
+        # Update optimizer learning rate
+        self._update_learning_rate(self.policy.optimizer)
+        # Compute current clip range
+        clip_range = self.clip_range(self._current_progress_remaining)
+        # Optional: clip range for the value function
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
 
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        clip_fractions = []
+
+        continue_training = True
+
+        # train for n_epochs epochs
+        for epoch in range(self.n_epochs):
+            if self.task_adaptive:
+                task_weightss = []
+                with th.no_grad():
+                    _, _, entropy = self.policy.evaluate_actions(
+                        {key: th.tensor(obs, device=self.device) for (key, obs) in self.rollout_buffer.observations.items()},
+                        th.tensor(self.rollout_buffer.actions, device=self.device),
+                        action_masks=th.tensor(self.rollout_buffer.action_masks, device=self.device),
+                        normalize_entropy=True,
+                        query_nums=th.tensor(self.env.envs[0].unwrapped.query_nums, device=self.device)
+                    )
+                    mean_entropy = np.array([
+                        entropy[np.where(self.rollout_buffer.observations["task_id"]==i)[0]].mean().item()
+                        for i in range(self.env.envs[0].unwrapped.num_tasks)
+                    ])
+                    task_weights = mean_entropy / sum(mean_entropy) * self.env.envs[0].unwrapped.num_tasks
+                    task_weightss.append(task_weights)
+                    print(f"Train epoch={epoch}, task weights={task_weights}")
+            approx_kl_divs = []
+            # Do a complete pass on the rollout buffer
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    # Convert discrete action from float to long
+                    actions = rollout_data.actions.long().flatten()
+
+                values, log_prob, entropy = self.policy.evaluate_actions(
+                    rollout_data.observations,
+                    actions,
+                    action_masks=rollout_data.action_masks,
+                )
+
+                values = values.flatten()
+                # Normalize advantage
+                advantages = rollout_data.advantages
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                # ratio between old and new policy, should be one at the first iteration
+                ratio = th.exp(log_prob - rollout_data.old_log_prob)
+
+                # clipped surrogate loss
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -th.min(policy_loss_1, policy_loss_2)
+                if self.task_adaptive:
+                    with th.no_grad():
+                        task_ids = rollout_data.observations["task_id"].cpu().numpy().squeeze()
+                        task_weights_ = th.tensor(task_weights[task_ids.astype(np.int64)], device=self.device)
+                    policy_loss = policy_loss * task_weights_
+                policy_loss = policy_loss.mean()
+
+                # Logging
+                pg_losses.append(policy_loss.item())
+                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+                clip_fractions.append(clip_fraction)
+
+                if self.clip_range_vf is None:
+                    # No clipping
+                    values_pred = values
+                else:
+                    # Clip the different between old and new value
+                    # NOTE: this depends on the reward scaling
+                    values_pred = rollout_data.old_values + th.clamp(
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                    )
+                # Value loss using the TD(gae_lambda) target
+                if self.task_adaptive and self.value_adaptive:
+                    value_loss = F.mse_loss(rollout_data.returns, values_pred, reduction="none")
+                    value_loss = value_loss * task_weights_
+                    value_loss = value_loss.mean()
+                else:
+                    value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
+
+                # Entropy loss favor exploration
+                if entropy is None:
+                    # Approximate entropy when no analytical form
+                    if self.task_adaptive and self.entropy_adaptive:
+                        entropy_loss = -th.mean(-log_prob * task_weights_)
+                    else:
+                        entropy_loss = -th.mean(-log_prob)
+                else:
+                    if self.task_adaptive and self.entropy_adaptive:
+                        entropy_loss = -th.mean(entropy * task_weights_)
+                    else:
+                        entropy_loss = -th.mean(entropy)
+
+                entropy_losses.append(entropy_loss.item())
+
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                # Calculate approximate form of reverse KL Divergence for early stopping
+                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
+                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
+                # and Schulman blog: http://joschu.net/blog/kl-approx.html
+                with th.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_divs.append(approx_kl_div)
+
+                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
+                    break
+
+                # Optimization step
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                # Clip grad norm
+                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+
+            if not continue_training:
+                break
+
+        self._n_updates += self.n_epochs
+        explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
+
+        # Logs
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/clip_range", clip_range)
+        if self.clip_range_vf is not None:
+            self.logger.record("train/clip_range_vf", clip_range_vf)
+        if self.task_adaptive:
+            task_weightss = np.array(task_weightss)
+            for i in range(self.env.envs[0].unwrapped.num_tasks):
+                self.logger.record(f"train/task_weight{i}", task_weightss[:, i].mean())
+
+        # Auxiliary phase
         if self.aux_cost_threshold is None:
             if type(self.rollout_buffer.observation_space) is spaces.Dict:
                 buffer_index_start = \
@@ -524,10 +717,13 @@ class MaskablePPG(MaskablePPO):
                 if self.aux_time_phase:
                     old_pds_time = np.empty(len(self._observations_buffer_time), dtype=object)
         else:
+            sched_env = self.env.envs[0].env.env
+            if not hasattr(sched_env, "baseline"):
+                sched_env = sched_env.env
             episode_num = int(sum(self.rollout_buffer.episode_starts.reshape(-1)))
             episode_length = int(self.rollout_buffer.buffer_size / episode_num)
             selected_episodes = list(filter(lambda i:self.rollout_buffer.rewards[(i+1)*episode_length-1] > \
-                                   self.env.envs[0].env.env.baseline - self.aux_cost_threshold, range(episode_num)))
+                                   sched_env.baseline - self.aux_cost_threshold, range(episode_num)))
             if len(selected_episodes) > 0:
                 selected_index = [i * episode_length + j for j in range(episode_length) for i in selected_episodes]
                 buffer_index_start = self.buffer_index_start

@@ -1,4 +1,4 @@
-import os
+import os, time
 
 import numpy as np
 from stable_baselines3.common.callbacks import EvalCallback
@@ -31,15 +31,18 @@ class MaskableEvalCallback(EvalCallback):
     :param use_masking: Whether to use invalid action masks during evaluation
     """
 
-    def __init__(self, *args, use_masking: bool = True, **kwargs):
+    def __init__(self, *args, use_masking: bool = True, time_sleep: int = 0, sub_save_freq: int = 10, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_masking = use_masking
         self.last_eval_n_calls = -1
+        self.time_sleep = time_sleep
+        self.sub_save_freq = sub_save_freq
 
     def _on_step(self) -> bool:
         continue_training = True
 
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0 and self.n_calls != self.last_eval_n_calls:
+            time.sleep(self.time_sleep)
             self.last_eval_n_calls = self.n_calls
             # Sync training and eval env if there is VecNormalize
             if self.model.get_vec_normalize_env() is not None:
@@ -122,7 +125,7 @@ class MaskableEvalCallback(EvalCallback):
                 if self.callback_on_new_best is not None:
                     continue_training = self.callback_on_new_best.on_step()
             
-            if self.best_model_save_path is not None and self.current_epoch - self.last_save_epoch > 10:
+            if self.best_model_save_path is not None and self.current_epoch - self.last_save_epoch >= self.sub_save_freq:
                 self.last_save_epoch = self.current_epoch
                 self.model.save(os.path.join(self.best_model_save_path, f"sub_best_model_{self.current_epoch}"))
 

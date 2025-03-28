@@ -15,7 +15,7 @@ def add_query_hint(s, a, symbol=';'):
 
 class QueryList():
 
-    def __init__(self, conn, queries, table_list, conf):
+    def __init__(self, conn, queries, table_list, conf, vary_conn_num):
         self.conf = conf
         self.connection = conn
         self.queries = queries
@@ -33,6 +33,7 @@ class QueryList():
         self.cache_prefix = 'envs/scheduler/cache/{}/{}/'.format(self.conf['database']['host'], self.conf['database']['database'])
         # self.context = context(conn, table_list, self.max_worker)
         self.start_time = None
+        self.vary_conn_num = vary_conn_num
         self.build_list()
 
     def __len__(self):
@@ -107,15 +108,27 @@ class QueryList():
         if os.path.exists(costs_path):
             with open(costs_path) as f:
                 total_costs = json.load(f)
-            query_costs = [np.mean(clist) if len(clist) > 0 else -1 for clist in total_costs[f'max_worker={self.max_worker}']]
+            # if self.vary_conn_num and not (f'max_worker={self.max_worker}' in total_costs):
+            #     query_costs = [np.mean(clist) if len(clist) > 0 else -1 for clist in total_costs[f'max_worker=20']]
+            # else:
+            #     query_costs = [np.mean(clist) if len(clist) > 0 else -1 for clist in total_costs[f'max_worker={self.max_worker}']]
+            try:
+                query_costs = [np.mean(clist) if len(clist) > 0 else -1 for clist in total_costs[f'max_worker={self.max_worker}']]
+            except Exception as e:
+                # print(f"RuntimeWarning: {repr(e)}, using 'max_worker=20' as the key")
+                if 'max_worker=20' in total_costs:
+                    query_costs = [np.mean(clist) if len(clist) > 0 else -1 for clist in total_costs[f'max_worker=20']]
+                else:
+                    query_costs = [np.mean(clist) if len(clist) > 0 else -1 for clist in total_costs[f'max_worker=16']]
             # query_costs = query_costs * math.ceil(len(self.ids) / len(query_costs)) # For duplicate queries
             self.base_query_num = len(query_costs)
             if self.query_scale == 1:
                 self.original_query_num = len(self.ids)
-                if self.original_query_num <= self.base_query_num:
-                    self.costs = [query_costs[i-1] for i in self.ids]
-                else:
-                    self.costs = query_costs + query_costs[-(self.original_query_num - self.base_query_num):]
+                self.costs = [query_costs[(i-1)%self.base_query_num] for i in self.ids]
+                # if self.original_query_num <= self.base_query_num:
+                #     self.costs = [query_costs[i-1] for i in self.ids]
+                # else:
+                #     self.costs = query_costs + query_costs[-(self.original_query_num - self.base_query_num):]
             else:
                 self.original_query_num = int(len(self.ids) / self.query_scale)
                 self.costs = [query_costs[i-1] for i in self.ids]
@@ -136,10 +149,14 @@ class QueryList():
             costs_worker_list = []
             for key, value in costs_worker.items():
                 value = [np.mean(clist) if len(clist) > 0 else -1 for clist in value]
-                if self.original_query_num <= len(value):
-                    value = [value[i-1] for i in self.ids[:self.original_query_num]]
-                else:
-                    value = value + value[-(self.original_query_num - len(value)):]
+                try:
+                    value = [value[(i-1)%self.base_query_num] for i in self.ids]
+                except:
+                    value = [value[(i-1)%(self.base_query_num//self.query_scale)] for i in self.ids[:self.original_query_num]]
+                # if self.original_query_num <= len(value):
+                #     value = [value[i-1] for i in self.ids[:self.original_query_num]]
+                # else:
+                #     value = value + value[-(self.original_query_num - len(value)):]
                 costs_worker_list.append(value)
             self.worker_masks = [[True for _ in range(len(costs_worker_list[0]))]] + [[False for __ in range(len(costs_worker_list[0]))] for _ in range(len(costs_worker_list) - 1) ]
             for i in range(1, len(costs_worker_list)):
@@ -194,7 +211,11 @@ class QueryList():
                         self.queries[self.id_to_pos[chosen_id]][1] = add_query_hint(self.queries[self.id_to_pos[chosen_id]][1], f' (MAXDOP {0 if worker == 0 else worker + 1})', '\.')
                         self.queries[self.id_to_pos[chosen_id]][3] = add_query_hint(self.queries[self.id_to_pos[chosen_id]][3], f' OPTION (MAXDOP {0 if worker == 0 else worker + 1})')
                 else:
-                    prefix += f'set max_parallel_workers_per_gather={(worker+1 if self.conf["database"]["database"].startswith("tpcds") else worker+2) if worker>0 else worker};'
+                    if self.conf["database"]["database"].startswith("imdb"):
+                        prefix += f'set max_parallel_workers_per_gather={worker+1 if worker>0 else worker};'    # 02
+                        # prefix += f'set max_parallel_workers_per_gather={worker+2};'    # 23
+                    else:
+                        prefix += f'set max_parallel_workers_per_gather={(worker+1 if self.conf["database"]["database"].startswith("tpcds") else worker+2) if worker>0 else worker};'
             if 'worker' in strategy:
                 prefix += f'set max_parallel_workers_per_gather={2 if chosen_id in self.long_queries else 0};'
         elif strategy in ['random']:

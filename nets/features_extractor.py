@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from gymnasium import spaces
 
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from nets.graph_encoder import GraphAttentionEncoder
+from nets.graph_encoder import GraphAttentionEncoder, GraphAttentionEncoderWithMask
 from nets.mha_encoder import EncoderLayer
 from nets.queryformer import QueryFormer
 from nets.model.database_util import Batch
@@ -68,10 +68,10 @@ class AttentionExtractor(BaseFeaturesExtractor):
                  dim_reduction: str = 'multilayer_perceptron', pre_embed: bool = False, reduced_features_dim: int = 32,
                  train_qf_data: Batch = None, costsw: dict = None, enable_tl: bool = False, pe_dim: int = None,
                  share_features: bool = True, con_query_num: int = None, cluster_result = None, mask_done: bool = False,
-                 feature_align: bool = False,):
+                 feature_align: bool = False, info_agg: bool = False):
         super().__init__(observation_space, features_dim)
-        self.embedding_type, self.dim_reduction, self.pre_embed, self.reduced_features_dim, self.pe_dim, self.share_features, self.con_query_num, self.mask_done, self.feature_align = \
-            embedding_type, dim_reduction, pre_embed, reduced_features_dim, pe_dim, share_features, con_query_num, mask_done, feature_align
+        self.embedding_type, self.dim_reduction, self.pre_embed, self.reduced_features_dim, self.pe_dim, self.share_features, self.con_query_num, self.mask_done, self.feature_align, self.info_agg = \
+            embedding_type, dim_reduction, pre_embed, reduced_features_dim, pe_dim, share_features, con_query_num, mask_done, feature_align, info_agg
         self.enable_qf, self.enable_cw, self.enable_tl, self.enable_pe, self.enable_cq = not train_qf_data is None, not costsw is None, enable_tl, not self.pe_dim is None, not self.con_query_num is None
         self.enable_cqe, self.enable_cl = self.enable_cq and self.reduced_features_dim <= 64, not cluster_result is None
         if self.enable_tl:
@@ -79,11 +79,19 @@ class AttentionExtractor(BaseFeaturesExtractor):
         else:
             self.query_num, self.status_num = observation_space.shape[0], observation_space[0].n
         if self.enable_cw:
+            original_query_num = train_qf_data.attn_bias.shape[0]
             if not self.enable_cl:
-                self.costs_worker = [[costsw[f'{i} 1'][2] / costsw[f'{i} 1'][3], costsw[f'{i} 3'][2] / costsw[f'{i} 3'][3] \
-                                      if f'{i} 3' in costsw.keys() else costsw[f'{i} 1'][2] / costsw[f'{i} 1'][3]] for i in range(1, self.query_num+1)]
+                try:
+                    self.costs_worker = [[costsw[f'{i} 1'][2] / costsw[f'{i} 1'][3], costsw[f'{i} 3'][2] / costsw[f'{i} 3'][3] \
+                                          if f'{i} 3' in costsw.keys() else costsw[f'{i} 1'][2] / costsw[f'{i} 1'][3]] for i in range(1, original_query_num+1)]
+                except:
+                    try:
+                        self.costs_worker = [[np.mean(costsw["max_parallel_workers_per_gather=0"][i]), \
+                                              np.mean(costsw["max_parallel_workers_per_gather=2"][i])] for i in range(0, original_query_num)]
+                    except:
+                        self.costs_worker = [[np.mean(costsw["max_parallel_workers_per_gather=2"][i]), \
+                                              np.mean(costsw["max_parallel_workers_per_gather=3"][i])] for i in range(0, original_query_num)]
             else:
-                original_query_num = train_qf_data.attn_bias.shape[0]
                 self.costs_worker = [[costsw[f'{i} 1'][2] / costsw[f'{i} 1'][3], costsw[f'{i} 3'][2] / costsw[f'{i} 3'][3] \
                                       if f'{i} 3' in costsw.keys() else costsw[f'{i} 1'][2] / costsw[f'{i} 1'][3]] for i in range(1, original_query_num+1)]
                 self.costs_worker *= self.query_num // original_query_num
@@ -142,13 +150,25 @@ class AttentionExtractor(BaseFeaturesExtractor):
                 nn.Tanh(),
             )
         if self.dim_reduction == 'super_node':
-            self.super_node_encoder = nn.Embedding(1, embedding_dim=self.reduced_features_dim)
-        self.embedder = GraphAttentionEncoder(
-            n_heads=n_heads,
-            embed_dim=self.reduced_features_dim,
-            n_layers=n_layers,
-            normalization=normalization
-        )
+            if self.info_agg:
+                self.super_node_encoder_con = nn.Embedding(1, embedding_dim=self.reduced_features_dim)
+                self.super_node_encoder_pen = nn.Embedding(1, embedding_dim=self.reduced_features_dim)
+            else:
+                self.super_node_encoder = nn.Embedding(1, embedding_dim=self.reduced_features_dim)
+        if info_agg:
+            self.embedder = GraphAttentionEncoderWithMask(
+                n_heads=n_heads,
+                embed_dim=self.reduced_features_dim,
+                n_layers=n_layers,
+                normalization=normalization
+            )
+        else:
+            self.embedder = GraphAttentionEncoder(
+                n_heads=n_heads,
+                embed_dim=self.reduced_features_dim,
+                n_layers=n_layers,
+                normalization=normalization
+            )
         # self.embedder = nn.TransformerEncoder(
         #     nn.TransformerEncoderLayer(
         #         d_model=reduced_features_dim,
@@ -188,6 +208,13 @@ class AttentionExtractor(BaseFeaturesExtractor):
                         nn.Linear(features_pi_dim // 2, features_dim),
                         nn.Tanh(),
                     )
+                elif self.info_agg:
+                    self.output_embed_pi = nn.Sequential(
+                        nn.Linear(self.reduced_features_dim * 3, features_dim),
+                        nn.Tanh(),
+                        nn.Linear(features_dim, features_dim),
+                        nn.Tanh(),
+                    )
                 else:
                     self.output_embed_pi = nn.Sequential(
                         # nn.Linear(self.reduced_features_dim * 2 + (self.con_query_num - 1) * 4 if self.enable_cq else self.reduced_features_dim * 2, features_dim),
@@ -195,8 +222,16 @@ class AttentionExtractor(BaseFeaturesExtractor):
                         nn.Tanh(),
                     )
                 if not self.feature_align:
-                    features_vf_dim = self.reduced_features_dim * 2 + self.query_num * (self.status_num + self.enable_cw)
+                    if self.info_agg:
+                        features_vf_dim = self.reduced_features_dim * 2
+                    else:
+                        features_vf_dim = self.reduced_features_dim * 2 + self.query_num * (self.status_num + self.enable_cw)
                     self.output_embed_vf = nn.Sequential(
+                        nn.Linear(features_vf_dim, features_dim),
+                        nn.Tanh(),
+                        nn.Linear(features_dim, features_dim),
+                        nn.Tanh(),
+                    ) if features_vf_dim / features_dim < 2 else (nn.Sequential(
                         nn.Linear(features_vf_dim, features_vf_dim // 2),
                         nn.Tanh(),
                         nn.Linear(features_vf_dim // 2, features_dim),
@@ -206,7 +241,7 @@ class AttentionExtractor(BaseFeaturesExtractor):
                         nn.Tanh(),
                         nn.Linear(features_vf_dim // 5, features_dim),
                         nn.Tanh(),
-                    )
+                    ))
         self.encoded_embeddings = None
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
@@ -217,7 +252,7 @@ class AttentionExtractor(BaseFeaturesExtractor):
         #         self.encoded_embeddings, _ = self.pre_embedder(self.init_embed(self.query_embeddings))
         #     else:
         #         self.encoded_embeddings = self.init_embed(self.query_embeddings)
-        if self.enable_qf and (self.query_embeddings is None or n_batch != 1):
+        if self.enable_qf and (self.query_embeddings is None or n_batch != 1 or self.query_embeddings.shape[0] != self.query_num):
             self.query_embeddings = self.query_former(self.train_qf_data.attn_bias, self.train_qf_data.rel_pos, self.train_qf_data.x,
                                                       self.train_qf_data.heights)
         # print('self.query_embeddings', self.query_embeddings)
@@ -244,7 +279,11 @@ class AttentionExtractor(BaseFeaturesExtractor):
         elif self.enable_cl and self.query_num >= self.query_embeddings.shape[0] * 2:
             self.query_embeddings = self.query_embeddings.repeat(self.query_num // self.query_embeddings.shape[0], 1)[:self.query_num]
         elif self.query_num > self.query_embeddings.shape[0]:
-            self.query_embeddings = th.cat([self.query_embeddings, self.query_embeddings[-inc_num:]], dim=0)
+            inc_num_, query_embeddings = inc_num, self.query_embeddings
+            while inc_num_ > self.query_embeddings.shape[0]:
+                query_embeddings = th.cat([query_embeddings, self.query_embeddings], dim=0)
+                inc_num_ -= self.query_embeddings.shape[0]
+            self.query_embeddings = th.cat([query_embeddings, self.query_embeddings[-inc_num_:]], dim=0)
         # print('status_emb', status_emb)
         status_embeddings = th.cat([self.query_embeddings.repeat(n_batch, 1, 1), status_emb], dim=2)
         original_query_num = len(self.costs_worker)
@@ -254,11 +293,15 @@ class AttentionExtractor(BaseFeaturesExtractor):
                 # costs_worker = th.tensor([[self.costs_worker[j][1] if status_emb[i][j][2] else self.costs_worker[j][0] for j in range(self.query_num)]
                 #                           for i in range(n_batch)]).view(n_batch, self.query_num, 1).to('cuda')
                 costs_worker = th.tensor([[self.costs_worker[j][1] if status_emb[i][j][2] else self.costs_worker[j][0] for j in range(original_query_num)]
-                                          for i in range(n_batch)]).view(n_batch, original_query_num, 1).to('cuda')
+                                          for i in range(n_batch)]).view(n_batch, original_query_num, 1).to(device='cuda', dtype=self.query_embeddings.dtype)
             else:
-                range_j = list(range(original_query_num)) + list(range(original_query_num))[-inc_num:]
+                inc_num_, range_j = inc_num, list(range(original_query_num))
+                while inc_num_ > original_query_num:
+                    range_j = range_j + list(range(original_query_num))
+                    inc_num_ -= original_query_num
+                range_j = range_j + list(range(original_query_num))[-inc_num_:]
                 costs_worker = th.tensor([[self.costs_worker[j][1] if status_emb[i][j][2] else self.costs_worker[j][0] for j in range_j]
-                                          for i in range(n_batch)]).view(n_batch, self.query_num, 1).to('cuda')
+                                          for i in range(n_batch)]).view(n_batch, self.query_num, 1).to(device='cuda', dtype=self.query_embeddings.dtype)
             status_embeddings = th.cat([status_embeddings, costs_worker], dim=2)
         # print('costs_worker', costs_worker)
         if self.enable_pe:
@@ -274,7 +317,31 @@ class AttentionExtractor(BaseFeaturesExtractor):
         encoded_status_embeddings = self.status_embed(status_embeddings)
         # print('encoded_status_embeddings', encoded_status_embeddings)
 
-        if self.dim_reduction == 'super_node':
+        if self.dim_reduction == 'super_node' and self.info_agg:
+            super_node_embedding_con = self.super_node_encoder_con.weight.unsqueeze(0).repeat(n_batch, 1, 1)
+            super_node_embedding_pen = self.super_node_encoder_pen.weight.unsqueeze(0).repeat(n_batch, 1, 1)
+            total_embeddings = th.cat([super_node_embedding_con, super_node_embedding_pen, encoded_status_embeddings], dim=1)
+
+            indices_con = th.where((query_status_layered[:, :, 0] == 0) & (query_status_layered[:, :, -1] == 0))
+            indices_pen = th.where(query_status_layered[:, :, 0] == 1)
+            mask = th.ones((n_batch, total_embeddings.shape[1], total_embeddings.shape[1]), dtype=th.bool, device='cuda')
+            mask[:, 0, 0] = 0       # sn_con2sn_con
+            mask[:, 1, 1] = 0       # sn_pen2sn_pen
+            for batch in range(n_batch):
+                batch_indices_con = indices_con[1][indices_con[0]==batch] + 2
+                mask[batch, 0, batch_indices_con] = 0   # sn_con2con
+                mask[batch, batch_indices_con.unsqueeze(0), batch_indices_con.unsqueeze(1)] = 0     # con2con
+                batch_indices_pen = indices_pen[1][indices_pen[0]==batch] + 2
+                mask[batch, 1, batch_indices_pen] = 0   # sn_pen2pen
+                # mask[batch, batch_indices_pen.unsqueeze(0), batch_indices_pen.unsqueeze(1)] = 0     # pen2pen
+
+            output = self.embedder(total_embeddings, mask=mask)
+            if type(output) != th.Tensor: output = output[0]
+            output_vf = output[:, :2, :].view(n_batch, -1)
+            output_pi = th.cat([output[:, :2, :].view(n_batch, 1, -1).repeat(1, output.shape[1], 1), output], dim=2)
+
+            return self.output_embed_pi(output_pi[:, 2:2+self.query_num, :]), self.output_embed_vf(output_vf)
+        elif self.dim_reduction == 'super_node':
             super_node_embedding = self.super_node_encoder.weight.unsqueeze(0).repeat(n_batch, 1, 1)
             if self.mask_done:
                 indices = th.where(query_status_layered[:, :, -1] == 1)

@@ -191,6 +191,28 @@ class MaskableA2C(A2C):
 
         return total_timesteps, callback
 
+    def set_env(self, env, n_steps=None, force_reset=True):
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.policy.observation_space = env.observation_space
+        self.policy.action_space = env.action_space
+        self.policy.features_extractor.query_num = env.observation_space['query_status'].shape[0]
+        self.policy.action_dist.action_dim = env.action_space.n
+        super().set_env(env, force_reset)
+
+        if n_steps is not None:
+            self.n_steps = n_steps
+        buffer_cls = MaskableDictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else MaskableRolloutBuffer
+        self.rollout_buffer = buffer_cls(
+            self.n_steps,
+            self.observation_space,
+            self.action_space,
+            self.device,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs,
+        )
+
     def collect_rollouts(
         self,
         env: VecEnv,

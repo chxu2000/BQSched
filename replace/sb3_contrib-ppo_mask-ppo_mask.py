@@ -312,7 +312,8 @@ class MaskablePPO(OnPolicyAlgorithm):
             if callback.on_step() is False:
                 return False
 
-            # self._update_info_buffer(infos)
+            if self.env.envs[0].unwrapped.vary_conn_num:
+                self._update_info_buffer(infos)
             n_steps += 1
 
             if isinstance(self.action_space, spaces.Discrete):
@@ -332,66 +333,70 @@ class MaskablePPO(OnPolicyAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]
                     rewards[idx] += self.gamma * terminal_value
 
-            # rollout_buffer.add(
-            #     self._last_obs,
-            #     actions,
-            #     rewards,
-            #     self._last_episode_starts,
-            #     values,
-            #     log_probs,
-            #     action_masks=action_masks,
-            # )
-            rollout_infos.append({
-                'infos': infos,
-                '_last_obs': self._last_obs,
-                'actions': actions,
-                'rewards': rewards,
-                '_last_episode_starts': self._last_episode_starts,
-                'values': values,
-                'log_probs': log_probs,
-                'action_masks': action_masks
-            })
+            if self.env.envs[0].unwrapped.vary_conn_num:
+                rollout_buffer.add(
+                    self._last_obs,
+                    actions,
+                    rewards,
+                    self._last_episode_starts,
+                    values,
+                    log_probs,
+                    action_masks=action_masks,
+                )
+            else:
+                rollout_infos.append({
+                    'infos': infos,
+                    '_last_obs': self._last_obs,
+                    'actions': actions,
+                    'rewards': rewards,
+                    '_last_episode_starts': self._last_episode_starts,
+                    'values': values,
+                    'log_probs': log_probs,
+                    'action_masks': action_masks
+                })
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
-            for idx, done in enumerate(dones):
-                if (
-                    done
-                    and rewards[0] <= env.envs[0].env.env.baseline
-                ):
-                    for info in rollout_infos:
-                        if env.envs[0].env.env.reward_type == 'delayed_relative_time_with_baseline':
-                            sched_env, scheduler = env.envs[0].env.env, env.envs[0].env.env._last_scheduler
-                            qpos = info['actions'][0][0] % sched_env.action_num
-                            try:
-                                if self.policy.features_extractor.enable_cl:
-                                    for qqpos in th.where(self.policy.features_extractor.cluster_result==qpos)[0]:
-                                        info['rewards'][0] += scheduler.query_time_info['relative'][qqpos] * scheduler.query_list.costs[qqpos] / scheduler.total_time
-                                else:
+            if not self.env.envs[0].unwrapped.vary_conn_num:
+                for idx, done in enumerate(dones):
+                    if (
+                        done
+                        and rewards[0] <= env.envs[0].env.env.baseline
+                    ):
+                        for info in rollout_infos:
+                            ### Added by xch
+                            if env.envs[0].env.env.reward_type == 'delayed_relative_time_with_baseline':
+                                sched_env, scheduler = env.envs[0].env.env, env.envs[0].env.env._last_scheduler
+                                qpos = info['actions'][0][0] % sched_env.action_num
+                                try:
+                                    if self.policy.features_extractor.enable_cl:
+                                        for qqpos in th.where(self.policy.features_extractor.cluster_result==qpos)[0]:
+                                            info['rewards'][0] += scheduler.query_time_info['relative'][qqpos] * scheduler.query_list.costs[qqpos] / scheduler.total_time
+                                    else:
+                                        info['rewards'][0] += scheduler.query_time_info['relative'][qpos] * scheduler.query_list.costs[qpos] / scheduler.total_time
+                                except Exception as _:
                                     info['rewards'][0] += scheduler.query_time_info['relative'][qpos] * scheduler.query_list.costs[qpos] / scheduler.total_time
-                            except Exception as _:
-                                info['rewards'][0] += scheduler.query_time_info['relative'][qpos] * scheduler.query_list.costs[qpos] / scheduler.total_time
-                        ###
-                        self._update_info_buffer(info['infos'])
-                        rollout_buffer.add(
-                            info['_last_obs'],
-                            info['actions'],
-                            info['rewards'],
-                            info['_last_episode_starts'],
-                            info['values'],
-                            info['log_probs'],
-                            action_masks=info['action_masks'],
-                        )
-                    rollout_infos = []
-                elif (
-                    done
-                    and rewards[0] > env.envs[0].env.env.baseline
-                ):
-                    query_num = len(env.envs[0].env.env._scheduler.query_list.ids)
-                    self.num_timesteps -= env.num_envs * query_num
-                    n_steps -= query_num
-                    callback.n_calls -= query_num
-                    rollout_infos = []
+                            ###
+                            self._update_info_buffer(info['infos'])
+                            rollout_buffer.add(
+                                info['_last_obs'],
+                                info['actions'],
+                                info['rewards'],
+                                info['_last_episode_starts'],
+                                info['values'],
+                                info['log_probs'],
+                                action_masks=info['action_masks'],
+                            )
+                        rollout_infos = []
+                    elif (
+                        done
+                        and rewards[0] > env.envs[0].env.env.baseline
+                    ):
+                        query_num = len(env.envs[0].env.env._scheduler.query_list.ids)
+                        self.num_timesteps -= env.num_envs * query_num
+                        n_steps -= query_num
+                        callback.n_calls -= query_num
+                        rollout_infos = []
 
         with th.no_grad():
             # Compute value for the last timestep
@@ -572,7 +577,7 @@ class MaskablePPO(OnPolicyAlgorithm):
         callback.on_training_start(locals(), globals())
 
         while self.num_timesteps < total_timesteps:
-            self.env.reset()    # Added
+            self._last_obs = self.env.reset()   # Added
             continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, self.n_steps, use_masking)
 
             if continue_training is False:
