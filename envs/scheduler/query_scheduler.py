@@ -347,6 +347,7 @@ class QueryScheduler():
         self.relative_time, self.relative_time_clamp, self.total_time = 1e-10, 1e-10, 1e-10
         self.next_qpos = -1
         self.next_worker = -1
+        self.next_mem = -1
         self.cost = -1
         self.mean_tailing = -1
         self.err_flag = False
@@ -536,7 +537,7 @@ class QueryScheduler():
                             if self.query_list.query_scale > 1 and self.query_cluster:
                                 query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos+self.query_list.original_query_num*(self.current_cluster-1), worker=self.next_worker, cur_state=cur_state)
                             else:
-                                query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
+                                query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, mem=self.next_mem, cur_state=cur_state)
                             obj = t.submit(thread_query, idx, self.conn_list[idx], query, self.runtime_log)
                             if query[0][0] != -1:
                                 self.start_query(query[0][0], self.next_worker, idx, time.time())
@@ -575,7 +576,7 @@ class QueryScheduler():
                 if self.query_list.query_scale > 1 and self.query_cluster:
                     query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos+self.query_list.original_query_num*(self.current_cluster-1), worker=self.next_worker, cur_state=cur_state)
                 else:
-                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
+                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, mem=self.next_mem, cur_state=cur_state)
                 obj = t.submit(thread_query, qid, self.conn_list[qid], query, self.runtime_log) if not self.use_simulator else None
                 if not self.use_simulator:
                     self.start_query(query[0][0], self.next_worker, qid, time.time())
@@ -608,7 +609,7 @@ class QueryScheduler():
                                 if self.query_list.query_scale > 1 and self.query_cluster:
                                     query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos+self.query_list.original_query_num*(self.current_cluster-1), worker=self.next_worker, cur_state=cur_state)
                                 else:
-                                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, cur_state=cur_state)
+                                    query = self.query_list.get_next_query(strategy=self.strategy, id=self.next_qpos, worker=self.next_worker, mem=self.next_mem, cur_state=cur_state)
                                 obj = t.submit(thread_query, idx, self.conn_list[idx], query, self.runtime_log)
                                 if query[0][0] != -1:
                                     self.start_query(query[0][0], self.next_worker, idx, time.time())

@@ -57,6 +57,8 @@ class QueryList():
         self.build_cgroups()
         # self.build_conn_queries()
         self.build_worker_masks()
+        self.build_mem_masks()
+        self.build_worker_mem_masks()
 
     def build_clean_queries(self):
         for rawq in self.raw_queries:
@@ -169,6 +171,43 @@ class QueryList():
             costs_worker_np = np.array(costs_worker_list)
             # self.soft_worker_masks = np.sqrt(costs_worker_np[0, :]/costs_worker_np[1, :]/2)   # 1
             self.soft_worker_masks = costs_worker_np[0, :]/costs_worker_np[1, :]-np.sqrt(2)     # 2
+
+    def build_mem_masks(self):
+        costs_mem_path = self.cache_prefix + 'costs_mem.json'
+        if os.path.exists(costs_mem_path):
+            with open(costs_mem_path) as f:
+                costs_mem = json.load(f)
+            costs_mem_list = []
+            for key, value in costs_mem.items():
+                value = [np.mean(clist) if len(clist) > 0 else -1 for clist in value]
+                try:
+                    value = [value[(i-1)%self.base_query_num] for i in self.ids]
+                except:
+                    value = [value[(i-1)%(self.base_query_num//self.query_scale)] for i in self.ids[:self.original_query_num]]
+                # if self.original_query_num <= len(value):
+                #     value = [value[i-1] for i in self.ids[:self.original_query_num]]
+                # else:
+                #     value = value + value[-(self.original_query_num - len(value)):]
+                costs_mem_list.append(value)
+            self.mem_masks = [[True for _ in range(len(costs_mem_list[0]))]] + [[False for __ in range(len(costs_mem_list[0]))] for _ in range(len(costs_mem_list) - 1) ]
+            for i in range(1, len(costs_mem_list)):
+                for j in range(self.original_query_num):
+                    if (costs_mem_list[i][j] < costs_mem_list[0][j] * (1 - float(self.conf['scheduler']['rel_improve']))) and \
+                        ((costs_mem_list[0][j] - costs_mem_list[i][j]) > float(self.conf['scheduler']['abs_improve'])):
+                        self.mem_masks[i][j] = True
+            for i in range(len(self.mem_masks)):
+                self.mem_masks[i] *= self.query_scale
+            costs_mem_np = np.array(costs_mem_list)
+            self.soft_mem_masks = costs_mem_np[0, :]/costs_mem_np[1, :]-np.sqrt(2)     # 2
+    
+    def build_worker_mem_masks(self):
+        if hasattr(self, 'worker_masks') and hasattr(self, 'mem_masks'):
+            assert len(self.worker_masks[0]) == len(self.mem_masks[0]), 'worker_masks and mem_masks must have the same base query number'
+            self.worker_mem_masks = [
+                [self.worker_masks[i][k] and self.mem_masks[j][k] for k in range(len(self.worker_masks[0]))]
+                for j in range(len(self.mem_masks))
+                for i in range(len(self.worker_masks))
+            ]
     
     def build_dops(self):
         dops_path = self.cache_prefix + 'dops.json'
@@ -194,7 +233,7 @@ class QueryList():
             with open(conn_queries_path) as f:
                 self.conn_queries = json.load(f)[f'max_worker={self.max_worker}']
 
-    def get_next_query(self, strategy, id=None, worker=None, cur_state=None):
+    def get_next_query(self, strategy, id=None, worker=None, mem=None, cur_state=None):
         prefix, postfix = '', ''
         if 'index' in strategy:
             chosen_id = self.ids[id]
@@ -216,6 +255,9 @@ class QueryList():
                         # prefix += f'set max_parallel_workers_per_gather={worker+2};'    # 23
                     else:
                         prefix += f'set max_parallel_workers_per_gather={(worker+1 if self.conf["database"]["database"].startswith("tpcds") else worker+2) if worker>0 else worker};'
+            if mem is not None and mem != -1:
+                work_mem = "\'16MB\'" if mem > 0 else "\'4MB\'"
+                prefix += f'set work_mem={work_mem};'
             if 'worker' in strategy:
                 prefix += f'set max_parallel_workers_per_gather={2 if chosen_id in self.long_queries else 0};'
         elif strategy in ['random']:

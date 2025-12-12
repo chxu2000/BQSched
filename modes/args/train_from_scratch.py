@@ -10,6 +10,7 @@ class Args():
     enable_feature_align = False
     enable_soft_masking = False
     enable_worker = True
+    enable_mem = True
     max_worker = 2
     action_flatten = True
     train_reward_type = 'relative_time_with_baseline'

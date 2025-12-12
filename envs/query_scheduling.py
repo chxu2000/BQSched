@@ -74,6 +74,7 @@ class QuerySchedulingEnv(gym.Env):
         self.enable_time_last = args.enable_time_last
         self.conn_ssh = None
         self.enable_worker = args.enable_worker
+        self.enable_mem = args.enable_mem if hasattr(args, 'enable_mem') else False
         self.max_worker = args.max_worker
         self.action_flatten = args.action_flatten
         self.runtime_log = runtime_log
@@ -88,6 +89,8 @@ class QuerySchedulingEnv(gym.Env):
         assert not (self.query_cluster and self.worker_cluster), 'query_cluster and worker_cluster not supported in the meanwhile'
         assert not (self.vertical_cluster and self.worker_cluster), 'vertical_cluster and worker_cluster not supported in the meanwhile'
         assert not (self.overlap_cluster and self.worker_cluster), 'overlap_cluster and worker_cluster not supported in the meanwhile'
+        assert (not self.enable_mem) or (self.enable_worker and self.action_flatten), \
+            'enable_mem requires enable_worker and action_flatten'
         if self.overlap_cluster or self.worker_cluster:
             assert len(self.cluster_result) == args.query_num * self.query_scale, 'length of cluster result not correct'
 
@@ -149,7 +152,10 @@ class QuerySchedulingEnv(gym.Env):
 
         if self.enable_worker:
             if self.action_flatten:
-                self.action_space = spaces.Discrete(self.action_num * self.max_worker)
+                if self.enable_mem:
+                    self.action_space = spaces.Discrete(self.action_num * self.max_worker * 2)
+                else:
+                    self.action_space = spaces.Discrete(self.action_num * self.max_worker)
             else:
                 self.action_space = spaces.MultiDiscrete(np.array([self.action_num, self.max_worker]))
         else:
@@ -270,8 +276,13 @@ class QuerySchedulingEnv(gym.Env):
                 action -= (1 if self.compress_action_c else 3)
             if self.enable_worker:
                 if self.action_flatten:
-                    action_q = action % self.action_num
-                    action_w = action // self.action_num
+                    if self.enable_mem:
+                        action_q = action % self.action_num
+                        action_w = action // self.action_num % self.max_worker
+                        action_m = action // self.action_num // self.max_worker
+                    else:
+                        action_q = action % self.action_num
+                        action_w = action // self.action_num
                 else:
                     action_q = action[0]
                     action_w = action[1]
@@ -284,7 +295,11 @@ class QuerySchedulingEnv(gym.Env):
                 return self._get_obs(), -1e4, True, {}
             self._scheduler.next_qpos = action_q
             if self.enable_worker:
-                self._scheduler.next_worker = action_w
+                if self.enable_mem:
+                    self._scheduler.next_worker = action_w
+                    self._scheduler.next_mem = action_m
+                else:
+                    self._scheduler.next_worker = action_w
             # Execute the query and get return value from generator
             if self.vertical_cluster:
                 for i in range(self.query_scale):
@@ -430,7 +445,12 @@ class QuerySchedulingEnv(gym.Env):
         elif self._scheduler.query_list.query_scale == 1 or not self._scheduler.query_cluster:
             if self.enable_worker:
                 if self.action_flatten:
-                    return np.logical_and(self._scheduler.query_list.worker_masks[:self.max_worker], self._query_status==0).reshape(-1)
+                    if self.enable_mem:
+                        mid = len(self._scheduler.query_list.worker_mem_masks) // 2
+                        worker_mem_masks = self._scheduler.query_list.worker_mem_masks[:self.max_worker] + self._scheduler.query_list.worker_mem_masks[mid:mid+self.max_worker]
+                        return np.logical_and(worker_mem_masks, self._query_status==0).reshape(-1)
+                    else:
+                        return np.logical_and(self._scheduler.query_list.worker_masks[:self.max_worker], self._query_status==0).reshape(-1)
                 else:
                     return list(self._query_status == 0) + [True] * self.max_worker
             else:
